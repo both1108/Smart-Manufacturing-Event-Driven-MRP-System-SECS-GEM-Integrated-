@@ -284,10 +284,12 @@ def build_dashboard_data():
         iot_x = []
         iot_temp = []
         iot_vibration = []
+        iot_rpm = []
         if not iot_df.empty:
             iot_x = iot_df["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
             iot_temp = iot_df["temperature"].astype(float).round(2).tolist()
             iot_vibration = iot_df["vibration"].astype(float).round(4).tolist()
+            iot_rpm = iot_df["rpm"].astype(float).tolist()
 
         po_labels = []
         po_values = []
@@ -344,6 +346,7 @@ def build_dashboard_data():
                     "x": iot_x,
                     "temperature": iot_temp,
                     "vibration": iot_vibration,
+                    "rpm": iot_rpm,
                 },
                 "po": {
                     "labels": po_labels,
@@ -706,6 +709,14 @@ def index():
                             mode: "lines+markers",
                             name: TEXT[LANG].vibration,
                             yaxis: "y2"
+                        },
+                        {
+                            x: data.charts.iot.x,
+                            y: data.charts.iot.rpm,
+                            type: "scatter",
+                            mode: "lines+markers",
+                            name: "RPM",
+                            yaxis: "y3"
                         }
                     ], {
                         title: TEXT[LANG].iot_chart_title,
@@ -719,6 +730,12 @@ def index():
                             title: TEXT[LANG].vibration,
                             overlaying: "y",
                             side: "right"
+                        },
+                        yaxis3: {
+                            title: "RPM",
+                            overlaying: "y",
+                            side: "right",
+                            position: 0.95
                         }
                     }, {responsive: true});
 
