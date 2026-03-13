@@ -1,5 +1,5 @@
 # Smart Manufacturing MRP & IoT Simulation Dashboard
-
+![Demo](demo.gif)
 ## Overview
 
 This project demonstrates a **Smart Manufacturing analytics system** that integrates:
