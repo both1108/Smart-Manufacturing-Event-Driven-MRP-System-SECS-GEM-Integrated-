@@ -1,3 +1,6 @@
-pymysql
+flask
 pandas
-matplotlib
+plotly
+psycopg2
+pymysql
+python-dotenv
