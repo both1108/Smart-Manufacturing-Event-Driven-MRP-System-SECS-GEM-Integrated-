@@ -25,26 +25,7 @@ By combining forecasting, capacity adjustment, and MRP logic, this system provid
 
 ## 🔄 System Flow
 
-Order History (PostgreSQL)
-        ↓
-Demand Forecasting
-        ↓
-Machine Health → Capacity Adjustment
-        ↓
-Expected Production Output
-        ↓
-BOM Explosion
-        ↓
-Part-Level Demand
-        ↓
-Inventory + Incoming PO
-        ↓
-Shortage Detection
-        ↓
-MRP Purchase Recommendations
-        ↓
-Dashboard Visualization
-
+![System Flow](system_flow.png)
 ---
 
 ## 🚀 Key Features
