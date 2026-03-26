@@ -120,6 +120,8 @@ git clone https://github.com/both1108/mrp-python.git
 cd mrp-python
 
 cp .env.example .env
+# (Windows CMD: use `copy .env.example .env`)
+
 
 docker compose up --build
 ```
