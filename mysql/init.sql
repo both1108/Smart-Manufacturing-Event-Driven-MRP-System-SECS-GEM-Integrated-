@@ -50,12 +50,35 @@ CREATE TABLE IF NOT EXISTS machine_data (
   KEY idx_machine_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Equipment Events
+CREATE TABLE IF NOT EXISTS equipment_events (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  event_time DATETIME NOT NULL,
+  machine_id VARCHAR(20) NOT NULL,
+  source_type VARCHAR(20) NOT NULL,   -- EVENT / ALARM / COMMAND
+  stream INT NOT NULL,
+  func INT NOT NULL,
+  transaction_id INT NULL,
+  event_name VARCHAR(100) NULL,
+  alarm_id VARCHAR(50) NULL,
+  alarm_text VARCHAR(255) NULL,
+  command_name VARCHAR(50) NULL,
+  state_before VARCHAR(20) NULL,
+  state_after VARCHAR(20) NULL,
+  note VARCHAR(255) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_equipment_machine_time (machine_id, event_time),
+  KEY idx_equipment_source (source_type),
+  KEY idx_equipment_sf (stream, func)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Clean old data
 TRUNCATE TABLE bom_detail;
 TRUNCATE TABLE bom_header;
 TRUNCATE TABLE parts;
 TRUNCATE TABLE purchase;
 TRUNCATE TABLE machine_data;
+TRUNCATE TABLE equipment_events;
 
 -- Insert BOM header
 INSERT INTO bom_header (bom_id, product_code) VALUES
