@@ -22,6 +22,7 @@ from repositories.transaction_repository import get_order_history_df
 from services.health_service import compute_health_score
 from services.forecast_service import build_complete_history, build_forecast
 from services.mrp_service import simulate_inventory_and_mrp
+from repositories.machine_downtime_repository import MachineDowntimeRepository
 
 
 def build_dashboard_data():
@@ -174,7 +175,44 @@ def build_dashboard_data():
         sim["stock_qty"] = pd.to_numeric(sim["stock_qty"], errors="coerce").fillna(0.0)
         sim["safety_qty"] = pd.to_numeric(sim["safety_qty"], errors="coerce").fillna(0.0)
 
-        sim = simulate_inventory_and_mrp(sim, DEFAULT_LEADTIME_DAYS)
+        # 查 capacity_loss_daily，整合停機產能損失進 MRP 模擬
+        # 分兩段處理：
+        #   past_losses  (過去 30 天 ~ 今天)  → 從 stock_qty 扣，因為庫存已經少了
+        #   future_losses(明天 ~ 模擬結束)    → 從 incoming_qty 扣（預排停機）
+        from datetime import timedelta as _td
+        today = date.today()
+        sim_end = today + _td(days=FORECAST_DAYS)
+        capacity_loss_map = {}
+
+        for pn in parts_list:
+            try:
+                # 過去損失 → 調降 stock_qty（只影響第一列，後面的列會跟著連動）
+                past_rows = MachineDowntimeRepository.sum_losses_by_day(
+                    part_no=str(pn),
+                    start_date=today - _td(days=30),
+                    end_date=today,
+                )
+                total_past_loss = sum(float(r["total_lost_qty"]) for r in past_rows)
+                if total_past_loss > 0:
+                    mask = sim["part_no"] == str(pn)
+                    sim.loc[mask, "stock_qty"] = (
+                        sim.loc[mask, "stock_qty"] - total_past_loss
+                    ).clip(lower=0)
+
+                # 未來損失 → capacity_loss_map，在模擬內逐日扣 incoming_qty
+                future_rows = MachineDowntimeRepository.sum_losses_by_day(
+                    part_no=str(pn),
+                    start_date=today + _td(days=1),
+                    end_date=sim_end,
+                )
+                for r in future_rows:
+                    loss_date = r["loss_date"]
+                    date_key = loss_date.isoformat() if hasattr(loss_date, "isoformat") else str(loss_date)
+                    capacity_loss_map[(str(pn), date_key)] = float(r["total_lost_qty"])
+            except Exception:
+                pass
+
+        sim = simulate_inventory_and_mrp(sim, DEFAULT_LEADTIME_DAYS, capacity_loss_map=capacity_loss_map)
 
         part_risk_summary = (
             sim.groupby("part_no", as_index=False)
