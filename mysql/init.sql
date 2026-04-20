@@ -59,17 +59,59 @@ CREATE TABLE IF NOT EXISTS equipment_events (
   stream INT NOT NULL,
   func INT NOT NULL,
   transaction_id INT NULL,
+  ceid INT NULL,
   event_name VARCHAR(100) NULL,
   alarm_id VARCHAR(50) NULL,
   alarm_text VARCHAR(255) NULL,
+  alcd TINYINT UNSIGNED NULL,
   command_name VARCHAR(50) NULL,
   state_before VARCHAR(20) NULL,
   state_after VARCHAR(20) NULL,
   note VARCHAR(255) NULL,
+  payload JSON NULL,
+  correlation_id VARCHAR(36) NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   KEY idx_equipment_machine_time (machine_id, event_time),
   KEY idx_equipment_source (source_type),
-  KEY idx_equipment_sf (stream, func)
+  KEY idx_equipment_sf (stream, func),
+  KEY idx_equipment_ceid (ceid),
+  KEY idx_equipment_correlation (correlation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Machine Capacity
+CREATE TABLE IF NOT EXISTS machine_capacity (
+  machine_id VARCHAR(20) PRIMARY KEY,
+  produces_part VARCHAR(50) NOT NULL,
+  nominal_rate DECIMAL(10,2) NOT NULL,
+  efficiency DECIMAL(5,3) NOT NULL DEFAULT 1.000,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Machine Downtime Log
+CREATE TABLE IF NOT EXISTS machine_downtime_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  machine_id VARCHAR(20) NOT NULL,
+  start_time DATETIME NOT NULL,
+  end_time DATETIME NULL,
+  reason VARCHAR(20) NOT NULL,   -- 'ALARM' | 'IDLE'
+  lost_qty DECIMAL(10,2) NULL,
+  correlation_id VARCHAR(36) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_downtime_machine (machine_id, start_time),
+  KEY idx_downtime_open (machine_id, end_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Capacity Loss Daily
+CREATE TABLE IF NOT EXISTS capacity_loss_daily (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  part_no VARCHAR(50) NOT NULL,
+  loss_date DATE NOT NULL,
+  lost_qty DECIMAL(10,2) NOT NULL,
+  machine_id VARCHAR(20) NOT NULL,
+  correlation_id VARCHAR(36) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_loss_part_date (part_no, loss_date),
+  KEY idx_loss_machine (machine_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Clean old data
@@ -79,6 +121,9 @@ TRUNCATE TABLE parts;
 TRUNCATE TABLE purchase;
 TRUNCATE TABLE machine_data;
 TRUNCATE TABLE equipment_events;
+TRUNCATE TABLE machine_capacity;
+TRUNCATE TABLE machine_downtime_log;
+TRUNCATE TABLE capacity_loss_daily;
 
 -- Insert BOM header
 INSERT INTO bom_header (bom_id, product_code) VALUES
@@ -110,6 +155,11 @@ INSERT INTO purchase (part_no, delivery_date, order_qty, status) VALUES
   ('PART-E', CURDATE() + INTERVAL 3 DAY, 4, 'pending'),
   ('PART-C', CURDATE() - INTERVAL 2 DAY, 5, 'received');
 
+-- Insert machine capacity
+INSERT INTO machine_capacity (machine_id, produces_part, nominal_rate, efficiency) VALUES
+  ('M-01', 'PART-A', 12.0, 0.95),
+  ('M-02', 'PART-B', 10.0, 0.90);
+  
 -- Insert machine data
 INSERT INTO machine_data (machine_id, temperature, vibration, rpm, created_at) VALUES
   ('M-01', 72.5, 0.0310, 1500, NOW() - INTERVAL 18 MINUTE),

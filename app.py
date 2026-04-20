@@ -1,10 +1,11 @@
 from flask import Flask, render_template
 from routes.dashboard_routes import dashboard_bp
 from routes.equipment_routes import equipment_bp
-
+from bootstrap import bootstrap_event_pipeline
 
 def create_app():
     app = Flask(__name__)
+    bootstrap_event_pipeline()  # ★新增
 
     # ✅ 正確：在這裡註冊
     app.register_blueprint(dashboard_bp)

@@ -1,17 +1,28 @@
+from typing import Optional
+
 import pymysql
-from repositories.equipment_event_repository import EquipmentEventRepository
+
+from config.secs_gem_codes import ALID, ALID_TEXT
 from db.mysql import get_mysql_conn
+from repositories.equipment_event_repository import EquipmentEventRepository
+from services.event_bus import bus as default_bus
+from services.state_machine import StateMachine
 
 
 class EquipmentMonitorService:
     TEMP_THRESHOLD = 85.0
     VIB_THRESHOLD = 0.0800
 
+    # 預設使用模組層級的 EventBus；測試時可以傳自訂的 bus。
+    _fsm = StateMachine(default_bus)
+
+    # ------------------------------------------------------------------
+    # 資料存取（保持原本的寫法）
+    # ------------------------------------------------------------------
     @staticmethod
     def get_latest_machine_data(machine_id):
         conn = get_mysql_conn()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
-
         sql = """
         SELECT *
         FROM machine_data
@@ -21,121 +32,72 @@ class EquipmentMonitorService:
         """
         cursor.execute(sql, (machine_id,))
         row = cursor.fetchone()
-
         cursor.close()
         conn.close()
         return row
 
+    # ------------------------------------------------------------------
+    # 狀態推斷 — 回傳 (state, alid, reason)，讓 StateMachine 可以把警報
+    # 資訊塞進 AlarmTriggered。
+    # ------------------------------------------------------------------
     @staticmethod
     def infer_state(machine_row):
         if not machine_row:
-            return "UNKNOWN"
+            return "UNKNOWN", None, None
 
         temp = float(machine_row["temperature"])
         vib = float(machine_row["vibration"])
         rpm = int(machine_row["rpm"])
 
-        if temp >= EquipmentMonitorService.TEMP_THRESHOLD or vib >= EquipmentMonitorService.VIB_THRESHOLD:
-            return "ALARM"
-
+        if temp >= EquipmentMonitorService.TEMP_THRESHOLD:
+            return "ALARM", ALID.OVERHEAT, f"temperature={temp} >= {EquipmentMonitorService.TEMP_THRESHOLD}"
+        if vib >= EquipmentMonitorService.VIB_THRESHOLD:
+            return "ALARM", ALID.HIGH_VIBRATION, f"vibration={vib} >= {EquipmentMonitorService.VIB_THRESHOLD}"
         if rpm > 0:
-            return "RUN"
+            return "RUN", None, None
+        return "IDLE", None, None
 
-        return "IDLE"
-
+    # ------------------------------------------------------------------
+    # 總控
+    # ------------------------------------------------------------------
     @staticmethod
-    def analyze_machine(machine_id):
-        latest_data = EquipmentMonitorService.get_latest_machine_data(machine_id)
-        if not latest_data:
-            return {
-                "machine_id": machine_id,
-                "status": "no_data",
-                "message": "No machine_data found"
-            }
+    def analyze_machine(machine_id: str, fsm: Optional[StateMachine] = None):
+        fsm = fsm or EquipmentMonitorService._fsm
 
-        current_state = EquipmentMonitorService.infer_state(latest_data)
+        latest = EquipmentMonitorService.get_latest_machine_data(machine_id)
+        if not latest:
+            return {"machine_id": machine_id, "status": "no_data"}
 
-        latest_event = EquipmentEventRepository.get_latest_event(machine_id)
-        previous_state = latest_event["state_after"] if latest_event else "UNKNOWN"
+        current_state, alid, reason = EquipmentMonitorService.infer_state(latest)
 
-        result = {
-            "machine_id": machine_id,
-            "temperature": float(latest_data["temperature"]),
-            "vibration": float(latest_data["vibration"]),
-            "rpm": int(latest_data["rpm"]),
-            "data_time": latest_data["created_at"].isoformat() if latest_data["created_at"] else None,
-            "previous_state": previous_state,
-            "current_state": current_state,
-            "event_written": False
+        # 只抓「帶狀態資訊」的最新事件；避免 AlarmTriggered / AlarmReset
+        # 的 S5F1 / S6F11 row（state_after 為 NULL）把 previous_state 吃成 None。
+        latest_event = EquipmentEventRepository.get_latest_state_event(machine_id)
+        previous_state = (latest_event or {}).get("state_after") or "UNKNOWN"
+
+        metrics = {
+            "temperature": float(latest["temperature"]),
+            "vibration": float(latest["vibration"]),
+            "rpm": int(latest["rpm"]),
         }
 
-        if current_state == previous_state:
-            result["message"] = "State unchanged, no new event written"
-            return result
+        result = fsm.advance(
+            machine_id=machine_id,
+            from_state=previous_state,
+            to_state=current_state,
+            metrics=metrics,
+            now=latest["created_at"],
+            reason=reason,
+            alid=alid,
+            alarm_text=ALID_TEXT.get(alid, "") if alid else None,
+        )
 
-        if current_state == "ALARM":
-            EquipmentEventRepository.insert_event(
-                event_time=latest_data["created_at"],
-                machine_id=machine_id,
-                source_type="EVENT",
-                stream=6,
-                func=11,
-                transaction_id=None,
-                event_name="AlarmTriggered",
-                state_before=previous_state,
-                state_after="ALARM",
-                note="State changed to ALARM based on machine_data thresholds"
-            )
-
-            EquipmentEventRepository.insert_event(
-                event_time=latest_data["created_at"],
-                machine_id=machine_id,
-                source_type="ALARM",
-                stream=5,
-                func=1,
-                transaction_id=None,
-                alarm_id="AL-001",
-                alarm_text=f"Overheat or high vibration detected (temp={latest_data['temperature']}, vib={latest_data['vibration']})",
-                state_before=previous_state,
-                state_after="ALARM",
-                note="Auto-generated from machine_data"
-            )
-
-            result["event_written"] = True
-            result["message"] = "Alarm events written"
-
-        elif current_state == "RUN":
-            EquipmentEventRepository.insert_event(
-                event_time=latest_data["created_at"],
-                machine_id=machine_id,
-                source_type="EVENT",
-                stream=6,
-                func=11,
-                transaction_id=None,
-                event_name="MachineStarted",
-                state_before=previous_state,
-                state_after="RUN",
-                note="State changed to RUN based on machine_data"
-            )
-
-            result["event_written"] = True
-            result["message"] = "Run event written"
-
-        elif current_state == "IDLE":
-            EquipmentEventRepository.insert_event(
-                event_time=latest_data["created_at"],
-                machine_id=machine_id,
-                source_type="EVENT",
-                stream=6,
-                func=11,
-                transaction_id=None,
-                event_name="MachineStopped",
-                state_before=previous_state,
-                state_after="IDLE",
-                note="State changed to IDLE based on machine_data"
-            )
-
-            result["event_written"] = True
-            result["message"] = "Idle event written"
-
-        return result
+        return {
+            "machine_id": machine_id,
+            "previous_state": previous_state,
+            "current_state": current_state,
+            "state_changed": result.changed,
+            "events_emitted": [type(e).__name__ for e in result.events],
+            "metrics": metrics,
+            "data_time": latest["created_at"].isoformat() if latest["created_at"] else None,
+        }
