@@ -1,10 +1,10 @@
 """
-In-memory event types flowing through the EventBus.
+DomainEvent dataclasses — what flows through the EventBus.
 
-These are distinct from rows in `equipment_events`: a DomainEvent is what the
-state machine emits, and one DomainEvent may end up producing *multiple*
-equipment_events rows (e.g. AlarmReset → one S5F1 ALCD=0 row + one S6F11 CEID
-1004 row), plus a downtime-close row, plus an MRP recompute trigger.
+Week 3 additions: MRPRecomputeRequested + MRPPlanUpdated.
+These let MRP runs participate in the event audit trail like any other
+event. Purchasing decisions become queryable by correlation_id, all the
+way back to the originating equipment alarm.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,12 +24,15 @@ class DomainEvent:
     correlation_id: str = field(default_factory=_new_correlation_id)
 
 
+# ---------------------------------------------------------------------------
+# Equipment-layer events
+# ---------------------------------------------------------------------------
 @dataclass
 class StateChanged(DomainEvent):
     from_state: str = "UNKNOWN"
     to_state: str = "UNKNOWN"
     metrics: Dict[str, Any] = field(default_factory=dict)
-    reason: Optional[str] = None  # e.g. "temperature>=85"
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -41,7 +44,6 @@ class AlarmTriggered(DomainEvent):
 
 @dataclass
 class AlarmReset(DomainEvent):
-    """Emitted when a machine leaves the ALARM state (ALARM -> RUN|IDLE)."""
     alid: int = 0
     alarm_text: str = ""
     previous_state: str = "ALARM"
@@ -50,10 +52,12 @@ class AlarmReset(DomainEvent):
 
 @dataclass
 class MachineHeartbeat(DomainEvent):
-    """Periodic sample — not every sample becomes a SECS event."""
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Production-layer event
+# ---------------------------------------------------------------------------
 @dataclass
 class DowntimeClosed(DomainEvent):
     """Fired by CapacityTracker when a downtime interval finishes."""
@@ -62,3 +66,44 @@ class DowntimeClosed(DomainEvent):
     reason: str = "ALARM"
     lost_qty: float = 0.0
     produces_part: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Business-layer events (Week 3)
+# ---------------------------------------------------------------------------
+@dataclass
+class MRPRecomputeRequested(DomainEvent):
+    """Command — 'recompute MRP for this part.'
+
+    Carries the correlation_id of the equipment event that triggered it,
+    so the resulting plan can be traced all the way back to the alarm.
+    Reasons:
+      - 'projected_loss'   — emitted by scheduler on AlarmTriggered (MTTR-based).
+      - 'reconciled_loss'  — emitted by scheduler on DowntimeClosed (actual).
+      - 'manual'           — POSTed by /api/mrp/recompute.
+      - 'inventory_adjusted' — for future ERP integration.
+    """
+    part_no: str = ""
+    reason: str = "manual"
+    projected_loss_qty: float = 0.0
+    triggered_by: str = ""  # human-readable: "alarm M-01 ALID 1001"
+
+
+@dataclass
+class MRPPlanUpdated(DomainEvent):
+    """Result — 'here is the latest plan summary for this part.'
+
+    Detailed per-day rows go to mrp_plan_history (written by MRPRunner).
+    The summary fields here are what the projector writes to mrp_plan_view
+    for the dashboard.
+    """
+    part_no: str = ""
+    reason: str = "manual"
+    horizon_start: Optional[datetime] = None
+    horizon_end: Optional[datetime] = None
+    capacity_loss_qty: float = 0.0
+    total_shortage_qty: float = 0.0
+    earliest_shortage_date: Optional[datetime] = None
+    suggested_po_qty: float = 0.0
+    suggested_order_date: Optional[datetime] = None
+    has_shortage: bool = False

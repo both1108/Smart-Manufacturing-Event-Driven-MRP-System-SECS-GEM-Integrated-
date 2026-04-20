@@ -1,28 +1,26 @@
+import asyncio
 import random
-import time
 from datetime import datetime
+from typing import Dict
 
-from db.mysql import get_mysql_conn_with_retry
-from config.settings import (
-    SIMULATOR_RETRIES,
-    SIMULATOR_RETRY_DELAY,
-    SIMULATOR_SLEEP_SECONDS,
-    SIMULATOR_CLEANUP_EVERY,
-    SIMULATOR_CLEANUP_MINUTES,
-)
+from services.ingest import EquipmentIngest, RawEquipmentSignal
 
 
-machine_states = {
+# Initial state per machine — same as the existing simulator.
+DEFAULT_MACHINES: Dict[str, Dict] = {
     "M-01": {"temperature": 74.0, "vibration": 0.0350, "rpm": 1480},
     "M-02": {"temperature": 72.0, "vibration": 0.0320, "rpm": 1450},
 }
 
 
-def clamp(value, min_value, max_value):
-    return max(min_value, min(value, max_value))
+def clamp(v, lo, hi):
+    return max(lo, min(v, hi))
 
 
-def update_machine_state(state):
+def update_machine_state(state: Dict) -> None:
+    """Same stochastic walk as before — kept identical so behaviour is
+    bit-for-bit comparable during the migration. Replace with a recipe-
+    driven trajectory in week 3."""
     state["temperature"] = clamp(
         state["temperature"] + random.uniform(-0.6, 0.9), 60, 95
     )
@@ -32,8 +30,7 @@ def update_machine_state(state):
     state["rpm"] = int(clamp(
         state["rpm"] + random.randint(-12, 15), 1000, 1600
     ))
-
-    if random.random() < 0.08:
+    if random.random() < 0.08:  # spike event
         state["temperature"] = clamp(
             state["temperature"] + random.uniform(2.0, 5.0), 60, 95
         )
@@ -45,65 +42,33 @@ def update_machine_state(state):
         ))
 
 
-def insert_machine_data(cursor, machine_id, state):
-    sql = """
-    INSERT INTO machine_data
-    (machine_id, temperature, vibration, rpm, created_at)
-    VALUES (%s, %s, %s, %s, %s)
-    """
-
-    data = (
-        machine_id,
-        round(state["temperature"], 2),
-        round(state["vibration"], 4),
-        state["rpm"],
-        datetime.now(),
-    )
-
-    cursor.execute(sql, data)
-    print("Inserted:", data, flush=True)
-
-
-def cleanup_old_data(cursor):
-    sql = f"""
-    DELETE FROM machine_data
-    WHERE created_at < NOW() - INTERVAL {SIMULATOR_CLEANUP_MINUTES} MINUTE
-    """
-    cursor.execute(sql)
-    print(f"🧹 Cleaned records older than {SIMULATOR_CLEANUP_MINUTES} minutes", flush=True)
+async def run_machine(
+    ingest: EquipmentIngest,
+    machine_id: str,
+    state: Dict,
+    period_s: float = 1.0,
+) -> None:
+    seq = 0
+    while True:
+        update_machine_state(state)
+        seq += 1
+        sig = RawEquipmentSignal(
+            machine_id=machine_id,
+            at=datetime.utcnow(),  # store in UTC; localize in dashboards
+            metrics={
+                "temperature": round(state["temperature"], 2),
+                "vibration": round(state["vibration"], 4),
+                "rpm": state["rpm"],
+            },
+            edge_seq=f"{machine_id}-{seq}",
+            source="simulator",
+        )
+        await ingest.offer(sig)
+        await asyncio.sleep(period_s)
 
 
-def run_simulator():
-    conn = get_mysql_conn_with_retry(
-        retries=SIMULATOR_RETRIES,
-        delay=SIMULATOR_RETRY_DELAY,
-    )
-    cursor = conn.cursor()
-
-    print("🚀 IoT Simulator started...", flush=True)
-
-    loop_count = 0
-
-    try:
-        while True:
-            for machine_id, state in machine_states.items():
-                update_machine_state(state)
-                insert_machine_data(cursor, machine_id, state)
-
-            loop_count += 1
-            if loop_count % SIMULATOR_CLEANUP_EVERY == 0:
-                cleanup_old_data(cursor)
-
-            time.sleep(SIMULATOR_SLEEP_SECONDS)
-
-    except KeyboardInterrupt:
-        print("\n🛑 Simulator stopped by user.", flush=True)
-
-    finally:
-        cursor.close()
-        conn.close()
-        print("✅ MySQL connection closed.", flush=True)
-
-
-if __name__ == "__main__":
-    run_simulator()
+async def run_simulator(ingest: EquipmentIngest) -> None:
+    states = {mid: dict(s) for mid, s in DEFAULT_MACHINES.items()}
+    await asyncio.gather(*[
+        run_machine(ingest, mid, st) for mid, st in states.items()
+    ])

@@ -13,8 +13,10 @@ class EquipmentMonitorService:
     TEMP_THRESHOLD = 85.0
     VIB_THRESHOLD = 0.0800
 
-    # 預設使用模組層級的 EventBus；測試時可以傳自訂的 bus。
-    _fsm = StateMachine(default_bus)
+    # FSM 本身不再耦合 bus — 它回傳事件列表，由呼叫端決定怎麼分發。
+    # 在 polling-bridge 期間我們直接 publish 到模組層級的 EventBus；
+    # 未來切到 MachineActor + event_store 路線時，這一段會被 actor 取代。
+    _fsm = StateMachine()
 
     # ------------------------------------------------------------------
     # 資料存取（保持原本的寫法）
@@ -91,6 +93,14 @@ class EquipmentMonitorService:
             alid=alid,
             alarm_text=ALID_TEXT.get(alid, "") if alid else None,
         )
+
+        # Bridge step: publish events synchronously on the in-process bus so
+        # the existing subscribers (event_persister, capacity_tracker,
+        # mrp_impact_handler) still fire. Once ingestion moves to
+        # EquipmentIngest → MachineActor → event_store + outbox, the relay
+        # becomes the only publisher and this loop goes away.
+        for ev in result.events:
+            default_bus.publish(ev)
 
         return {
             "machine_id": machine_id,
