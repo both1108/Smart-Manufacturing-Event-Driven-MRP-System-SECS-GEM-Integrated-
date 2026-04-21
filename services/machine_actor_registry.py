@@ -65,6 +65,10 @@ class MachineActorRegistry(SignalSink):
     def get(self, machine_id: str) -> Optional[MachineActor]:
         return self._actors.get(machine_id)
 
+    def machine_ids(self) -> Tuple[str, ...]:
+        """Public accessor for registered machines (logs, readiness probes)."""
+        return tuple(self._actors.keys())
+
     async def stop_all(self) -> None:
         for a in self._actors.values():
             await a.stop()

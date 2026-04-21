@@ -94,14 +94,18 @@ class EquipmentMonitorService:
             alarm_text=ALID_TEXT.get(alid, "") if alid else None,
         )
 
-        # Bridge step: publish events synchronously on the in-process bus so
-        # the existing subscribers (event_persister, capacity_tracker,
-        # mrp_impact_handler) still fire. Once ingestion moves to
-        # EquipmentIngest → MachineActor → event_store + outbox, the relay
-        # becomes the only publisher and this loop goes away.
-        for ev in result.events:
-            default_bus.publish(ev)
-
+        # NOTE: This endpoint used to publish result.events to default_bus
+        # directly — the "polling bridge". That path is now retired:
+        # state transitions are owned by MachineDataTailer →
+        # EquipmentIngest → MachineActor → EventStore → OutboxRelay.
+        # The relay is the single publisher. Publishing here would
+        # double-fire every subscriber and corrupt the read model.
+        #
+        # This route is now a READ: it reports what the FSM *would*
+        # decide given the current metrics, without mutating any state.
+        # For the authoritative machine state, query
+        #   SELECT state FROM machine_status_view WHERE machine_id = ?
+        # or GET /api/equipment/events for the event stream.
         return {
             "machine_id": machine_id,
             "previous_state": previous_state,

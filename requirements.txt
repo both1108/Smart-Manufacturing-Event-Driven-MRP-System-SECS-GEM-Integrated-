@@ -1,7 +1,42 @@
+# ---- runtime ---------------------------------------------------------------
+# HTTP + routing
 flask
+
+# -- Database drivers --
+# This system is intentionally a dual-database architecture with a
+# bounded-context split between the manufacturing and business sides.
+# Neither database depends on the other at the schema level; they are
+# bridged by domain events (MRPPlanUpdated, etc.) flowing through the
+# event bus.
+#
+#   MySQL      : manufacturing / event-pipeline side
+#                - machine_data, equipment_events
+#                - event_store, event_outbox
+#                - machine_status_view, mrp_plan_view (read models)
+#                - capacity_loss_daily, downtime_intervals
+#
+#   PostgreSQL : business / order-facing side
+#                - customer orders, procurement, BOM references
+#                - dashboard / reporting queries (heavier analytical load)
+#
+# Keeping the two apart means an equipment-side schema change can ship
+# without coordinating with the order team, and vice versa. The
+# manufacturing side stays OLTP-lean; the business side can adopt
+# analytical extensions (pg_stat_statements, TimescaleDB, materialized
+# views) without dragging the event pipeline along.
+pymysql
+cryptography          # required by pymysql for auth_caching_sha2_password
+psycopg2-binary       # PostgreSQL driver — business/order side + dashboards
+
+# Config / env
+python-dotenv
+
+# Dashboards / charts (dashboard_routes)
 pandas
 plotly
-psycopg2-binary
-pymysql
-python-dotenv
-cryptography
+
+# ---- dev / test ------------------------------------------------------------
+# Used by the Week 3 end-to-end integration test:
+#   offer(RawEquipmentSignal) -> actor -> event_store -> relay -> bus -> subs
+pytest
+pytest-asyncio
