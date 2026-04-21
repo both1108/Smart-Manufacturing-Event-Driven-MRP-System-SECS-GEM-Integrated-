@@ -30,6 +30,14 @@ psycopg2-binary       # PostgreSQL driver — business/order side + dashboards
 
 # Config / env
 python-dotenv
+PyYAML                # equipment inventory: config/equipment.yaml
+
+# SECS/GEM transport (Week 4)
+# Pinned to the 0.3.x series — 0.3 moved to asyncio-based HSMS and is
+# a significantly different API from 0.1.x/0.2.x. Do not upgrade to
+# 0.4+ without re-validating services/secs/session.py against the
+# secsgem release notes.
+secsgem>=0.3,<0.4
 
 # Dashboards / charts (dashboard_routes)
 pandas

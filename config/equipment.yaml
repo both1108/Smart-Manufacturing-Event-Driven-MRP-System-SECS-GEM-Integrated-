@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# Equipment inventory for the Week 4 SECS/GEM host.
+#
+# One entry per physical piece of equipment on the shop floor. In a
+# real deployment this list comes from the MES master data (or a
+# `machines` table); for the demo we keep it flat in YAML.
+#
+# Every entry here MUST correspond to a machine_id registered in
+# bootstrap.MACHINES and present in the machine_capacity table — the
+# MachineActorRegistry refuses signals for unknown machines by design.
+#
+# HSMS connect modes:
+#   ACTIVE  = the host dials out to the equipment (typical for central MES)
+#   PASSIVE = the host listens; equipment dials in (used when equipment
+#             is behind NAT or on an untrusted segment)
+#
+# For this project the simulator is reachable by hostname on the docker
+# network, so the host (app container) uses ACTIVE mode.
+# ---------------------------------------------------------------------------
+equipment:
+  - machine_id: M-01
+    description: "Stamping press, line A"
+    hsms:
+      address: simulator       # docker-compose service name
+      port: 5001
+      connect_mode: ACTIVE
+      session_id: 1
+      # T3 (reply timeout) / T5 (connect separation) / T6 (control tx)
+      # Defaults from SEMI E37 are fine for LAN; tune for WAN.
+      t3_reply_s: 45
+      t5_connect_separation_s: 10
+      t6_control_transaction_s: 5
+      t7_not_selected_s: 10
+      t8_network_intercharacter_s: 5
+      linktest_interval_s: 30
+    # CEIDs this host subscribes to at S2F37 (Enable Event Report).
+    # Listed by name so code review reads naturally; resolved to
+    # integers via config.secs_gem_codes.CEID at load time.
+    subscribed_ceids:
+      - SAMPLE_REPORT
+      - MACHINE_STARTED
+      - MACHINE_STOPPED
+      - ALARM_TRIGGERED
+      - ALARM_RESET
+
+  - machine_id: M-02
+    description: "Stamping press, line B"
+    hsms:
+      address: simulator
+      port: 5002
+      connect_mode: ACTIVE
+      session_id: 2
+      t3_reply_s: 45
+      t5_connect_separation_s: 10
+      t6_control_transaction_s: 5
+      t7_not_selected_s: 10
+      t8_network_intercharacter_s: 5
+      linktest_interval_s: 30
+    subscribed_ceids:
+      - SAMPLE_REPORT
+      - MACHINE_STARTED
+      - MACHINE_STOPPED
+      - ALARM_TRIGGERED
+      - ALARM_RESET

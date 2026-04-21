@@ -34,9 +34,11 @@ Order matters:
   5. Start OutboxRelay (single publisher).
   6. Start EquipmentIngest + MachineDataTailer (signal sources).
 """
+import asyncio
 import logging
 from typing import Any, Dict
 
+from config import settings
 from config.secs_gem_codes import ALID, ALID_TEXT
 from db.mysql import get_mysql_conn
 from repositories.machine_capacity_repository import MachineCapacityRepository
@@ -62,6 +64,13 @@ from services.state_machine import StateMachine
 from services.subscribers import capacity_tracker, mrp_impact_handler
 from services.subscribers.mrp_recompute_scheduler import MRPRecomputeScheduler
 from services.subscribers.read_model_projector import ReadModelProjector
+
+# Week 4: SECS host adapter is imported eagerly. The module is safe to
+# import without secsgem installed — the library import is local to
+# EquipmentSession._build_handler() and only runs when a session
+# actually starts. That lets `SIGNAL_SOURCE=tailer` deploys skip the
+# secsgem dependency entirely if they want.
+from services.secs import GemHostAdapter, load_equipment_config
 
 log = logging.getLogger(__name__)
 
@@ -217,20 +226,14 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
     relay.start()
 
     # ---------- 6. Signal sources ------------------------------------------
-
+    #
+    # Exactly one EquipmentIngest regardless of source, because the
+    # actor layer serializes per-machine and doesn't care where signals
+    # came from. The SIGNAL_SOURCE flag picks which transport(s) feed it.
     ingest = EquipmentIngest(sink=registry)
     ingest.start()
 
-    # MachineDataTailer bridges the existing simulator (which still
-    # INSERTs into machine_data) into the new pipeline. When Week 4
-    # replaces the simulator with a SECS equipment handler, the tailer
-    # is swapped for a GemHostHandler — nothing else changes.
-    tailer = MachineDataTailer(
-        ingest=ingest,
-        conn_factory=get_mysql_conn,
-        poll_interval_s=1.0,
-    )
-    tailer.start()
+    sources = await _start_signal_sources(ingest)
 
     _handles = {
         "store": store,
@@ -241,7 +244,7 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
         "scheduler": scheduler,
         "runner": runner,
         "projector": projector,
-        "tailer": tailer,
+        **sources,   # "tailer" and/or "secs_host"
     }
     # Flip readiness only after every component is wired. If any step
     # above raised, _ready stays False and /readyz returns 503, which
@@ -251,17 +254,90 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
     return _handles
 
 
+async def _start_signal_sources(ingest: EquipmentIngest) -> Dict[str, Any]:
+    """Build and start signal source(s) based on SIGNAL_SOURCE.
+
+    Three modes:
+      tailer  -- MachineDataTailer only (Week 1–3 default).
+      secsgem -- GemHostAdapter only (Week 4 target state).
+      both    -- run both in parallel for the Phase-2 validation window.
+                 Expect duplicate signals downstream; ingest dedup keys
+                 differ between sources by design so we can compare
+                 event_store rows per-source. NOT for production.
+
+    Returns a dict keyed by 'tailer' / 'secs_host' suitable for folding
+    into _handles. Downstream (shutdown, /readyz) only cares which keys
+    are present, not which branch produced them.
+    """
+    mode = (settings.SIGNAL_SOURCE or "tailer").lower()
+    if mode not in ("tailer", "secsgem", "both"):
+        raise ValueError(
+            f"SIGNAL_SOURCE must be tailer|secsgem|both, got {mode!r}"
+        )
+
+    sources: Dict[str, Any] = {}
+
+    if mode in ("tailer", "both"):
+        # MachineDataTailer bridges the existing simulator (which still
+        # INSERTs into machine_data) into the pipeline. Retired once
+        # SECS is authoritative (Phase 3 → Phase 4 of the Week 4 rollout).
+        tailer = MachineDataTailer(
+            ingest=ingest,
+            conn_factory=get_mysql_conn,
+            poll_interval_s=1.0,
+        )
+        tailer.start()
+        sources["tailer"] = tailer
+        log.info("signal source: tailer enabled (machine_data poll)")
+
+    if mode in ("secsgem", "both"):
+        # Equipment config is loaded strict-fail: a malformed yaml,
+        # unknown CEID name, or duplicate endpoint raises here and
+        # bootstrap aborts before _ready flips — exactly what we want
+        # an orchestrator to see. A half-configured host is worse than
+        # one that refuses to start.
+        equipment = load_equipment_config(settings.EQUIPMENT_CONFIG_PATH)
+        loop = asyncio.get_running_loop()
+        secs_host = GemHostAdapter(
+            ingest=ingest,
+            equipment=equipment,
+            loop=loop,
+        )
+        secs_host.start()
+        sources["secs_host"] = secs_host
+        log.info(
+            "signal source: secsgem enabled with %d sessions (%s)",
+            len(equipment),
+            ", ".join(e.machine_id for e in equipment),
+        )
+
+    if mode == "both":
+        # Loud warning because the two sources will each emit signals
+        # for the same machine, and /readyz only gates on SECS — someone
+        # running 'both' by accident would see clean reads with doubled
+        # writes in event_store. Parallel-run is a diagnostic mode.
+        log.warning(
+            "SIGNAL_SOURCE=both: tailer + secsgem both active. Downstream "
+            "events will be duplicated; this is Phase-2 diagnostic mode "
+            "only, do not run in production."
+        )
+
+    return sources
+
+
 async def shutdown_event_pipeline() -> None:
     """Orderly shutdown — stop signal sources before the publisher, so
     nothing gets dropped mid-flight.
 
     Shutdown order matters:
-      1. Tailer: stop pulling new rows from machine_data.
+      1. Signal sources (tailer and/or SECS host): stop pulling new
+         signals from their respective transports. After this point
+         no new work enters the pipeline.
       2. Ingest: drain the in-memory queue into actors.
       3. Actors: finish processing their mailbox (commits to event_store
-         + event_outbox are transactional, so an interrupted actor won't
-         corrupt state — but letting mailboxes drain means we don't lose
-         already-ingested signals).
+         + event_outbox are transactional, so an interrupted actor
+         won't corrupt state — but letting mailboxes drain means we
+         don't lose already-ingested signals).
       4. Relay: after actors are stopped, there are no new outbox rows;
          the relay drains what's left, then stops.
     """
@@ -270,7 +346,19 @@ async def shutdown_event_pipeline() -> None:
         return
     log.info("shutdown: stopping pipeline")
     _ready = False  # flip readiness off first so traffic stops arriving
-    await _handles["tailer"].stop()
+
+    # Stop whichever signal sources were actually started. Order within
+    # this step doesn't matter — they're independent transports feeding
+    # the same ingest queue.
+    for key in ("tailer", "secs_host"):
+        source = _handles.get(key)
+        if source is None:
+            continue
+        try:
+            await source.stop()
+        except Exception:
+            log.exception("shutdown: %s.stop() raised; continuing", key)
+
     await _handles["ingest"].stop()
     await _handles["registry"].stop_all()
     await _handles["relay"].stop()

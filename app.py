@@ -90,16 +90,37 @@ def readyz():
     In manufacturing terms: /healthz = "the controller is powered on",
     /readyz = "the controller has handshaked with all equipment and is
     ready to accept lots."
+
+    When SIGNAL_SOURCE includes secsgem, readiness is also gated on
+    every HSMS session being SELECTED. A host that booted cleanly but
+    can't reach its equipment is NOT ready to drive production — an
+    orchestrator routing traffic to it would produce empty plans.
     """
     if not pipeline_ready():
-        return jsonify({"status": "not_ready"}), 503
+        return jsonify({"status": "not_ready", "reason": "bootstrap"}), 503
+
     handles = app.config.get("PIPELINE_HANDLES") or {}
     registry = handles.get("registry")
-    machines = registry.machine_ids() if registry else ()
-    return jsonify({
+    secs_host = handles.get("secs_host")
+
+    body = {
         "status": "ready",
-        "machines": list(machines),
-    })
+        "machines": list(registry.machine_ids()) if registry else [],
+    }
+
+    # When SECS is one of the active signal sources, surface per-session
+    # state. In 'both' mode (diagnostic) we still include session status
+    # for visibility but we DON'T gate readiness on it — the tailer is
+    # carrying traffic too and we don't want a flaky HSMS to mask that.
+    if secs_host is not None:
+        body["secs_sessions"] = secs_host.session_status()
+        tailer_also_active = handles.get("tailer") is not None
+        if not tailer_also_active and not secs_host.all_selected():
+            body["status"] = "not_ready"
+            body["reason"] = "secs_sessions_not_selected"
+            return jsonify(body), 503
+
+    return jsonify(body)
 
 
 # ---------------------------------------------------------------------------

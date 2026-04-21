@@ -32,3 +32,21 @@ SIMULATOR_RETRY_DELAY = int(os.getenv("SIMULATOR_RETRY_DELAY", "3"))
 SIMULATOR_SLEEP_SECONDS = int(os.getenv("SIMULATOR_SLEEP_SECONDS", "3"))
 SIMULATOR_CLEANUP_EVERY = int(os.getenv("SIMULATOR_CLEANUP_EVERY", "20"))
 SIMULATOR_CLEANUP_MINUTES = int(os.getenv("SIMULATOR_CLEANUP_MINUTES", "30"))
+
+# ---------------------------------------------------------------------------
+# Week 4 — signal-source feature flag
+# ---------------------------------------------------------------------------
+# Controls which transport feeds EquipmentIngest at bootstrap. Values:
+#   "tailer"  : MachineDataTailer polls machine_data (Week 1–3 default)
+#   "secsgem" : GemHostAdapter receives S6F11/S5F1 over HSMS (Week 4 target)
+#   "both"    : run BOTH in parallel for the Phase-2 validation window.
+#               Expect duplicated signals downstream — this mode exists
+#               to compare event_store rows from the two sources, not
+#               to serve real production traffic.
+#
+# Keep as an env var (not a YAML field) so switching between modes in
+# docker-compose doesn't require rebuilding the image.
+SIGNAL_SOURCE = os.getenv("SIGNAL_SOURCE", "tailer")
+EQUIPMENT_CONFIG_PATH = os.getenv(
+    "EQUIPMENT_CONFIG_PATH", "config/equipment.yaml"
+)

@@ -25,7 +25,24 @@ services:
       - .env
     volumes:
       - .:/app
-    command: ["python", "-u", "iot_simulator.py"]
+    # Week 4: the simulator can run in one of two modes.
+    #   SIMULATOR_ENTRYPOINT=iot_simulator.py  (Week 1–3 baseline; writes
+    #                                           straight to MySQL machine_data)
+    #   SIMULATOR_ENTRYPOINT=-m simulators.secs_equipment.main
+    #                                          (Week 4; speaks SECS/GEM over HSMS
+    #                                           on ports 5001/5002 and lets the
+    #                                           host's GemHostAdapter ingest)
+    # Default stays on the baseline so existing dev flows don't break.
+    # Flip SIMULATOR_ENTRYPOINT in .env (or export it before `docker compose up`)
+    # when you want the SECS-mode simulator. Paired with SIGNAL_SOURCE on the
+    # app side: "secsgem" for authoritative, "both" for the parallel-run window.
+    command: ["sh", "-c", "exec python -u ${SIMULATOR_ENTRYPOINT:-iot_simulator.py}"]
+    # Expose the two HSMS listeners so a host running on the docker host
+    # (not inside the compose network) can also dial in — useful for local
+    # testing against a standalone host harness.
+    ports:
+      - "5001:5001"
+      - "5002:5002"
     restart: unless-stopped
 
   mysql:
