@@ -101,11 +101,18 @@ class TestUnpackS6F11DefensiveShape(unittest.TestCase):
         self.assertIn("expected list-of-3", str(ctx.exception))
 
     def test_raises_value_error_when_reports_section_is_int(self):
-        """data[2] is an int (the exact bug the user saw)."""
+        """Reports section is an int (the original byte-view regression).
+
+        Error must point at the reports section and include the
+        received type, so the first log line pinpoints the malformed
+        frame without needing a debugger.
+        """
         with self.assertRaises(ValueError) as ctx:
             EquipmentSession._unpack_s6f11([1001, CEID.SAMPLE_REPORT, 2])
-        self.assertIn("data[2]", str(ctx.exception))
-        self.assertIn("list-of-reports", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("reports", msg)
+        self.assertIn("list-of-reports", msg)
+        self.assertIn("int", msg)
 
     def test_none_reports_treated_as_empty(self):
         """Some secsgem builds emit None for an empty L,0 — not an error."""

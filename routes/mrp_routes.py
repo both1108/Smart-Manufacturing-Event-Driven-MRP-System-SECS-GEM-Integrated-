@@ -1,4 +1,3 @@
-from datetime import datetime
 import pymysql
 
 from flask import Blueprint, jsonify, request
@@ -6,6 +5,7 @@ from flask import Blueprint, jsonify, request
 from db.mysql import get_mysql_conn
 from services.domain_events import MRPRecomputeRequested
 from services.event_store import EventStore
+from utils.clock import utcnow
 
 bp = Blueprint("mrp", __name__, url_prefix="/api/mrp")
 
@@ -106,7 +106,7 @@ def request_recompute():
 
     ev = MRPRecomputeRequested(
         machine_id="*",
-        at=datetime.utcnow(),
+        at=utcnow(),
         part_no=part_no,
         reason="manual",
         triggered_by=f"api by {request.headers.get('X-User', 'anon')}",

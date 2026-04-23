@@ -1,10 +1,11 @@
 import os
 import random
 import time
-from datetime import datetime
 
 import pymysql
 from dotenv import load_dotenv
+
+from utils.clock import utcnow
 
 load_dotenv()
 
@@ -72,12 +73,15 @@ def insert_machine_data(machine_id, state):
     VALUES (%s, %s, %s, %s, %s)
     """
 
+    # tz-aware UTC — MySQL strips tz on DATETIME, but we write UTC by
+    # convention so the tailer can re-attach it on read (see
+    # services.machine_data_tailer._row_to_signal).
     data = (
         machine_id,
         round(state["temperature"], 2),
         round(state["vibration"], 4),
         state["rpm"],
-        datetime.now(),
+        utcnow(),
     )
 
     cursor.execute(sql, data)

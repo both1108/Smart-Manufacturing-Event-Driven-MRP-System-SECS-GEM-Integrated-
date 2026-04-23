@@ -11,6 +11,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 import uuid
 
+from utils.clock import utcnow
+
 
 def _new_correlation_id() -> str:
     return str(uuid.uuid4())
@@ -60,9 +62,14 @@ class MachineHeartbeat(DomainEvent):
 # ---------------------------------------------------------------------------
 @dataclass
 class DowntimeClosed(DomainEvent):
-    """Fired by CapacityTracker when a downtime interval finishes."""
-    start_time: datetime = field(default_factory=datetime.now)
-    end_time: datetime = field(default_factory=datetime.now)
+    """Fired by CapacityTracker when a downtime interval finishes.
+
+    Defaults use tz-aware UTC to match the rest of the event pipeline.
+    A naive `datetime.now()` default here would silently mix local-tz
+    timestamps into event_store under any container where TZ != UTC.
+    """
+    start_time: datetime = field(default_factory=utcnow)
+    end_time: datetime = field(default_factory=utcnow)
     reason: str = "ALARM"
     lost_qty: float = 0.0
     produces_part: Optional[str] = None

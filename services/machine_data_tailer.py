@@ -30,12 +30,13 @@ Design decisions:
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List
 
 import pymysql
 
 from services.ingest import EquipmentIngest, RawEquipmentSignal
+from utils.clock import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -136,9 +137,21 @@ class MachineDataTailer:
 
     @staticmethod
     def _row_to_signal(row: dict) -> RawEquipmentSignal:
+        # MySQL DATETIME columns strip tz info on write and return naive
+        # datetimes on read. The simulator writes in UTC by convention
+        # (see utils.clock.utcnow) so we re-attach UTC here — otherwise
+        # downstream consumers that compare `sig.at` against a tz-aware
+        # event would hit "can't compare offset-naive and offset-aware".
+        created_at = row.get("created_at")
+        if created_at is None:
+            at = utcnow()
+        elif created_at.tzinfo is None:
+            at = created_at.replace(tzinfo=timezone.utc)
+        else:
+            at = created_at
         return RawEquipmentSignal(
             machine_id=row["machine_id"],
-            at=row["created_at"] or datetime.utcnow(),
+            at=at,
             metrics={
                 "temperature": float(row["temperature"]),
                 "vibration": float(row["vibration"]),

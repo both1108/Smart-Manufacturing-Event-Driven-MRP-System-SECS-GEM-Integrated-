@@ -14,7 +14,7 @@ Dependencies are injected as callables so this module doesn't import
 from your repos directly — swap them in tests without mocking MySQL.
 """
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, Tuple
 
 import pandas as pd
@@ -23,6 +23,7 @@ from services.domain_events import MRPPlanUpdated, MRPRecomputeRequested
 from services.event_bus import EventBus
 from services.event_store import EventStore
 from services.mrp_service import simulate_inventory_and_mrp
+from utils.clock import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class MRPRunner:
             capacity_loss_map=loss_map,
         )
 
-        generated_at = datetime.utcnow()
+        generated_at = utcnow()
         self._write_plan_history(
             ev.correlation_id, ev.part_no, result_df, generated_at,
         )
@@ -93,8 +94,11 @@ class MRPRunner:
             correlation_id=ev.correlation_id,   # chain back
             part_no=ev.part_no,
             reason=ev.reason,
-            horizon_start=datetime.combine(start, datetime.min.time()),
-            horizon_end=datetime.combine(end, datetime.min.time()),
+            # Horizon bounds are calendar dates → midnight UTC. Making
+            # them tz-aware keeps comparisons with other event `at`
+            # fields safe (no naive/aware TypeError at dashboard time).
+            horizon_start=datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc),
+            horizon_end=datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc),
             capacity_loss_qty=summary["capacity_loss_qty"],
             total_shortage_qty=summary["total_shortage_qty"],
             earliest_shortage_date=summary["earliest_shortage_date"],

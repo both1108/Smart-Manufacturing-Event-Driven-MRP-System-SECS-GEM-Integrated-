@@ -226,31 +226,43 @@ class TestSendS6F11(unittest.TestCase):
         self.assertEqual(fake.sent_messages, [])
 
     def test_falls_back_to_send_and_waitfor_response_when_no_send_stream_function(self):
-        """Older secsgem builds may only expose the wait-for-response verb."""
+        """Older secsgem builds may only expose the wait-for-response verb.
+
+        Build a fake that explicitly does NOT define send_stream_function,
+        so getattr(handler, "send_stream_function", None) is None and the
+        fallback path runs. Pure duck-typed — we don't inherit from the
+        RecordingEquipmentHandler because `del type(x).attr` fails on
+        inherited attributes.
+        """
         sensor = SensorState(temperature=75.0, vibration=0.03, rpm=1500)
-        sess, fake = _make_session(sensor=sensor)
+        sess, _ = _make_session(sensor=sensor)
 
-        # Strip the fire-and-forget verb; the session must fall back.
-        waits: list[Any] = []
-
-        class _LegacyHandler(_RecordingEquipmentHandler):
+        class _LegacyOnlyHandler:
             def __init__(self):
-                super().__init__()
+                self.sent_bodies: list[dict[str, Any]] = []
+                self.waited: list[Any] = []
+
+            def stream_function(self, stream: int, function: int):
+                assert (stream, function) == (6, 11)
+                outer = self
+
+                def _build(body: dict[str, Any]):
+                    outer.sent_bodies.append(dict(body))
+                    return body
+
+                return _build
 
             def send_and_waitfor_response(self, msg):
-                waits.append(msg)
+                self.waited.append(msg)
                 return msg
 
-        legacy = _LegacyHandler()
-        # Remove the fire-and-forget attribute so getattr returns None.
-        del type(legacy).send_stream_function  # type: ignore[attr-defined]
+        legacy = _LegacyOnlyHandler()
         sess._handler = legacy  # type: ignore[assignment]
 
         sess._send_s6f11(CEID.SAMPLE_REPORT)
 
-        self.assertEqual(len(waits), 1, "fallback path must be used")
+        self.assertEqual(len(legacy.waited), 1, "fallback path must be used")
         self.assertEqual(len(legacy.sent_bodies), 1)
-        # Contract still holds on the legacy path.
         rpt = legacy.sent_bodies[0]["RPT"][0]
         self.assertEqual(rpt["RPTID"], RPTID.SENSOR_SNAPSHOT)
         self.assertEqual(rpt["V"], [75.0, 0.03, 1500])

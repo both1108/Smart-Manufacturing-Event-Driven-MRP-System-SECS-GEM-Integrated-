@@ -32,6 +32,7 @@ from services.domain_events import (
 )
 from services.event_bus import EventBus
 from services.event_store import EventStore
+from utils.clock import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ class MRPRecomputeScheduler:
     def _emit(self, part_no: str, payload: _Pending) -> None:
         ev = MRPRecomputeRequested(
             machine_id=payload.machine_id or "*",
-            at=payload.at or datetime.utcnow(),
+            at=payload.at or utcnow(),
             correlation_id=payload.correlation_id,   # CHAIN BACK to trigger
             part_no=part_no,
             reason=payload.reason,

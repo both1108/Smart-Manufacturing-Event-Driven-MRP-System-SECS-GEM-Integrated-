@@ -1,9 +1,9 @@
 import asyncio
 import random
-from datetime import datetime
 from typing import Dict
 
 from services.ingest import EquipmentIngest, RawEquipmentSignal
+from utils.clock import utcnow
 
 
 # Initial state per machine — same as the existing simulator.
@@ -54,7 +54,7 @@ async def run_machine(
         seq += 1
         sig = RawEquipmentSignal(
             machine_id=machine_id,
-            at=datetime.utcnow(),  # store in UTC; localize in dashboards
+            at=utcnow(),  # tz-aware UTC; dashboards localize on read
             metrics={
                 "temperature": round(state["temperature"], 2),
                 "vibration": round(state["vibration"], 4),
