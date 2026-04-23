@@ -48,8 +48,11 @@ from bootstrap import (
     shutdown_event_pipeline,
 )
 from db.mysql import get_mysql_conn_with_retry
+from routes.alarms_routes import alarms_bp
 from routes.dashboard_routes import dashboard_bp
 from routes.equipment_routes import equipment_bp
+from routes.events_routes import events_bp
+from routes.machines_routes import machines_bp
 from routes.mrp_routes import bp as mrp_bp
 
 logging.basicConfig(
@@ -66,6 +69,12 @@ app = Flask(__name__)
 app.register_blueprint(dashboard_bp)
 app.register_blueprint(equipment_bp)
 app.register_blueprint(mrp_bp)
+# New dashboard-layer blueprints (Week 5). One per top-level noun so
+# the URL trees stay shallow and per-route logs carry a stable blueprint
+# name in access logs.
+app.register_blueprint(machines_bp)
+app.register_blueprint(alarms_bp)
+app.register_blueprint(events_bp)
 
 
 @app.get("/healthz")

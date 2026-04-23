@@ -62,8 +62,10 @@ from services.mrp_runner import MRPRunner
 from services.outbox_relay import OutboxRelay
 from services.state_machine import StateMachine
 from services.subscribers import capacity_tracker, mrp_impact_handler
+from services.subscribers.alarm_projector import AlarmProjector
 from services.subscribers.mrp_recompute_scheduler import MRPRecomputeScheduler
 from services.subscribers.read_model_projector import ReadModelProjector
+from services.subscribers.telemetry_projector import TelemetryProjector
 
 # Week 4: SECS host adapter is imported eagerly. The module is safe to
 # import without secsgem installed — the library import is local to
@@ -197,6 +199,19 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
     projector = ReadModelProjector(conn_factory=get_mysql_conn)
     projector.register(bus)
 
+    # 3e. Dashboard read models (Week 5+).
+    #   - telemetry_history: per-sample rows for live charts. Append-only,
+    #     deduped by (machine_id, recorded_at).
+    #   - alarm_view: one row per (machine_id, alid), soft-cleared on
+    #     AlarmReset — backs the active-alarms panel.
+    # Both are rebuildable from event_store by replaying through the
+    # bus, so there's no schema migration risk to adding more fields.
+    telemetry_projector = TelemetryProjector(conn_factory=get_mysql_conn)
+    telemetry_projector.register(bus)
+
+    alarm_projector = AlarmProjector(conn_factory=get_mysql_conn)
+    alarm_projector.register(bus)
+
     # ---------- 4. Actor registry + rehydration ----------------------------
 
     registry = MachineActorRegistry(
@@ -244,6 +259,8 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
         "scheduler": scheduler,
         "runner": runner,
         "projector": projector,
+        "telemetry_projector": telemetry_projector,
+        "alarm_projector": alarm_projector,
         **sources,   # "tailer" and/or "secs_host"
     }
     # Flip readiness only after every component is wired. If any step

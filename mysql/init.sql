@@ -219,6 +219,63 @@ CREATE TABLE IF NOT EXISTS mrp_plan_history (
     KEY ix_part_date (part_no, forecast_date)
 ) ENGINE=InnoDB;
 
+-- Telemetry History Read Model
+--
+-- Append-only per-sample rows, projected from the event bus. Dashboards
+-- read this for live charts and for the "current value" row per machine
+-- (latest by (machine_id, recorded_at DESC)).
+--
+-- Idempotency: UNIQUE (machine_id, recorded_at). DATETIME(6) has μs
+-- precision, so genuine duplicates collide on replay and INSERT IGNORE
+-- drops the dupes. Distinct samples separated by >=1μs all persist.
+--
+-- We deliberately do NOT store event_seq here: EventBus subscribers
+-- receive only the event object, not the seq. correlation_id is the
+-- trace handle back to the originating transition/alarm.
+CREATE TABLE IF NOT EXISTS telemetry_history (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    machine_id      VARCHAR(32)  NOT NULL,
+    recorded_at     DATETIME(6)  NOT NULL,
+    temperature     DECIMAL(6,2) NOT NULL,
+    vibration       DECIMAL(8,4) NOT NULL,
+    rpm             INT          NOT NULL,
+    correlation_id  CHAR(36)     NOT NULL,
+    created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_machine_time (machine_id, recorded_at),
+    KEY ix_machine_time (machine_id, recorded_at DESC),
+    KEY ix_corr (correlation_id)
+) ENGINE=InnoDB;
+
+-- Alarm Read Model
+--
+-- One row per (machine_id, alid). AlarmTriggered upserts:
+--   - new alarm → inserts with triggered_at = last_seen_at = ev.at
+--   - repeat while still active → bumps last_seen_at; keeps triggered_at
+--   - repeat after clear → re-arms (cleared_at NULL, new triggered_at)
+-- AlarmReset soft-clears: sets cleared_at = ev.at.
+--
+-- Active-alarm query is cheap: WHERE cleared_at IS NULL (covered by
+-- ix_active). History of resolved alarms stays on the same row; the
+-- full audit trail lives in event_store.
+CREATE TABLE IF NOT EXISTS alarm_view (
+    machine_id       VARCHAR(32)  NOT NULL,
+    alid             INT          NOT NULL,
+    alarm_text       VARCHAR(255) NOT NULL,
+    severity         TINYINT      NOT NULL DEFAULT 0,
+    triggered_at     DATETIME(6)  NOT NULL,
+    last_seen_at     DATETIME(6)  NOT NULL,
+    cleared_at       DATETIME(6)  NULL,
+    acknowledged_at  DATETIME(6)  NULL,
+    acknowledged_by  VARCHAR(64)  NULL,
+    correlation_id   CHAR(36)     NOT NULL,
+    updated_at       DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                      ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (machine_id, alid),
+    KEY ix_active (cleared_at, machine_id),
+    KEY ix_corr (correlation_id)
+) ENGINE=InnoDB;
+
 
 -- Clean old data
 TRUNCATE TABLE bom_detail;
@@ -239,6 +296,8 @@ DELETE FROM event_store;
 DELETE FROM mrp_plan_history;
 DELETE FROM mrp_plan_view;
 DELETE FROM machine_status_view;
+DELETE FROM telemetry_history;
+DELETE FROM alarm_view;
 -- Insert BOM header
 INSERT INTO bom_header (bom_id, product_code) VALUES
   (1, '1001'),
