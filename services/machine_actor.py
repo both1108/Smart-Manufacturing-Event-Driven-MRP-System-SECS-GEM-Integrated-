@@ -15,17 +15,32 @@ the same millisecond are serialized naturally.
 In factory terms: this is your "equipment session" process — the one
 place that says "right now, M-01 is in ALARM state, ALID=1001, since
 10:03:17". Nobody else is allowed to have an opinion about that.
+
+Mailbox vocabulary:
+  - RawEquipmentSignal : telemetry sample from the simulator / SECS host
+  - ControlAction      : Remote Control panel button click (Week 5+)
+
+Both ride the same mailbox by design. A START click that arrives mid-
+stream of telemetry must serialize against those samples — applying it
+on a side channel would let us write a StateChanged for RUN→IDLE while
+a stale telemetry sample was still being inferred to RUN, racing the
+FSM into an inconsistent commit. One queue, one consumer, no races.
 """
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from services.domain_events import MachineHeartbeat
+from services.domain_events import (
+    DomainEvent,
+    HostCommandDispatched,
+    MachineHeartbeat,
+)
 from services.event_store import EventStore
 from services.ingest import RawEquipmentSignal
 from services.state_machine import StateMachine, UNKNOWN
+from utils.clock import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +69,43 @@ class MachineActorConfig:
     mailbox_size: int = 256
 
 
+@dataclass
+class ControlAction:
+    """An operator-issued state command that has already been validated
+    by CommandService against the current state.
+
+    The route handler computes `to_state` from the command (START→RUN,
+    STOP→IDLE, etc.) and the actor applies it without a second
+    validation round-trip. This keeps the actor's per-signal hot path
+    free of command-vocabulary knowledge: as far as the FSM is
+    concerned, this is just another transition request.
+    """
+    machine_id: str
+    command: str           # original SEMI E30 verb, for the dispatched event
+    user: str              # who pressed the button
+    to_state: str          # FSM target state, e.g. RUN / IDLE / ALARM
+    # correlation_id of the parent HostCommandRequested. Stamped onto
+    # every event the actor emits in response so a UI drill-down can
+    # trace click → dispatch → state change → recovery in one query.
+    correlation_id: str
+    reason: Optional[str] = None        # passed through to StateChanged.reason
+    alid: Optional[int] = None          # only set on synthetic ABORT
+    alarm_text: Optional[str] = None    # paired with alid for ABORT
+    at: datetime = field(default_factory=utcnow)
+    # True for commands that *lock* the tool in the target state
+    # (PAUSE / STOP / ABORT) — telemetry won't auto-transition out until
+    # a releasing command (START / RESUME / RESET) arrives. False for
+    # commands that *release* the lock and return the tool to
+    # sensor-driven control. Encoded on ControlAction rather than
+    # inferred in the actor so the rule stays with the vocabulary
+    # table in CommandService, and the actor stays vocabulary-agnostic.
+    holds_state: bool = False
+
+
+# Either kind of mailbox item. None is the stop sentinel.
+MailboxItem = Union[RawEquipmentSignal, ControlAction, None]
+
+
 class MachineActor:
     def __init__(
         self,
@@ -71,13 +123,29 @@ class MachineActor:
         self._alarm_text_for = alarm_text_for
         self._state = initial_state
         self._last_alid: Optional[int] = None
-        self._mailbox: asyncio.Queue[RawEquipmentSignal] = asyncio.Queue(
+        # Mailbox is heterogeneous: RawEquipmentSignal (telemetry) and
+        # ControlAction (operator command) ride the same queue so they
+        # serialize against each other naturally. None = stop sentinel.
+        self._mailbox: asyncio.Queue[MailboxItem] = asyncio.Queue(
             maxsize=cfg.mailbox_size
         )
         self._task: asyncio.Task | None = None
         # Heartbeat throttle — event-time based (sig.at), not wall-clock,
         # so replays produce the same heartbeat cadence as the live run.
         self._last_heartbeat_at: Optional[datetime] = None
+        # Operator hold — when non-None, the tool is under manual
+        # control and telemetry-driven FSM transitions are suppressed.
+        # Value is the FSM state the operator forced (IDLE for STOP/
+        # PAUSE, ALARM for ABORT). Cleared by releasing commands
+        # (START / RESUME / RESET).
+        #
+        # This is the "manual override" flag. In SEMI E30 terms it's
+        # the difference between CONTROL = ONLINE-REMOTE (host drives
+        # the tool based on sensor inference) and ONLINE-LOCAL (an
+        # operator has taken control at the panel). We're not modeling
+        # the full mode tree — just the one bit that matters for
+        # keeping the dashboard honest.
+        self._operator_hold: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Introspection (used by dashboards + tests)
@@ -112,29 +180,62 @@ class MachineActor:
         """
         await self._mailbox.put(sig)
 
+    async def offer_control(self, action: ControlAction) -> None:
+        """Enqueue an operator command on the same mailbox as telemetry.
+
+        Sharing the queue with offer() is what makes the actor the
+        single, race-free decision point for state. A START click that
+        arrives between two telemetry samples is processed strictly
+        after the earlier sample and strictly before the next one, so
+        the FSM never sees an interleaved view.
+
+        Like offer(), this blocks if the mailbox is full — backpressure
+        to the caller (in this case the Flask route, via
+        run_coroutine_threadsafe). At demo scale (3 machines, 1 Hz
+        telemetry, mailbox_size=256) it should never block in practice.
+        """
+        await self._mailbox.put(action)
+
     # ------------------------------------------------------------------
     # Loop
     # ------------------------------------------------------------------
     async def _run(self) -> None:
         while True:
-            sig = await self._mailbox.get()
-            if sig is None:
+            item = await self._mailbox.get()
+            if item is None:
                 return
             try:
                 # FSM + store writes are synchronous DB work; run in a
                 # worker thread so we don't block the event loop for
-                # other actors sharing this process.
-                await asyncio.to_thread(self._handle_sync, sig)
+                # other actors sharing this process. The handler is
+                # picked by item type — telemetry vs. operator command.
+                if isinstance(item, ControlAction):
+                    await asyncio.to_thread(self._handle_control_sync, item)
+                else:
+                    await asyncio.to_thread(self._handle_sync, item)
             except Exception:
                 # Losing one tick is acceptable; killing the actor is not.
                 # Next signal re-infers from fresh metrics.
-                log.exception("actor %s failed on signal",
+                log.exception("actor %s failed on mailbox item",
                               self._cfg.machine_id)
 
     # ------------------------------------------------------------------
     # Core logic — pure DB/CPU work, safe in a thread
     # ------------------------------------------------------------------
     def _handle_sync(self, sig: RawEquipmentSignal) -> None:
+        # Operator override — while the tool is under manual control,
+        # sensor inference is advisory only. The UI still sees live
+        # telemetry (via heartbeats) so the chart keeps updating, but
+        # no FSM transitions fire until a releasing command lands.
+        #
+        # Without this guard, a PAUSE on a healthy tool would flap:
+        # PAUSE drops IDLE → heartbeat samples still look normal →
+        # infer_state returns RUN → next tick advances IDLE → RUN,
+        # completely undoing the operator's intent.
+        if self._operator_hold is not None:
+            self._maybe_emit_heartbeat(sig)
+            return
+
         to_state, alid, reason = self._infer(sig.metrics)
         result = self._fsm.advance(
             machine_id=self._cfg.machine_id,
@@ -167,6 +268,103 @@ class MachineActor:
         self._last_heartbeat_at = sig.at
         self._state = to_state
         self._last_alid = alid
+
+    # ------------------------------------------------------------------
+    # Operator command path — same FSM, same store, different trigger.
+    # ------------------------------------------------------------------
+    def _handle_control_sync(self, action: ControlAction) -> None:
+        """Apply an operator-issued state command.
+
+        We deliberately route through the same StateMachine.advance()
+        the telemetry path uses, so the resulting StateChanged /
+        AlarmTriggered / AlarmReset events look identical to a
+        sensor-driven transition. Downstream subscribers (capacity
+        tracker, MRP, projectors) don't need a code branch for
+        "operator did this" vs "sensor caused this" — the only
+        difference is the parent HostCommandDispatched in the same
+        batch and the shared correlation_id.
+
+        Empty metrics are passed because the operator command carries
+        no fresh sample. The StateChanged.metrics field stays empty,
+        which the telemetry projector tolerates (it only writes a
+        telemetry_history row when the dict is non-empty).
+        """
+        from_state = self._state
+        result = self._fsm.advance(
+            machine_id=self._cfg.machine_id,
+            from_state=from_state,
+            to_state=action.to_state,
+            metrics={},
+            now=action.at,
+            reason=action.reason or f"host_command:{action.command}",
+            alid=action.alid,
+            alarm_text=action.alarm_text,
+        )
+
+        # Always emit HostCommandDispatched so the audit trail records
+        # "this click landed on this actor" — even on a no-op transition
+        # (e.g. RESUME on a tool that's already RUN). Pre-validation in
+        # CommandService is supposed to rule that out, but defending
+        # here keeps the audit log honest if validation gets bypassed.
+        dispatched = HostCommandDispatched(
+            machine_id=self._cfg.machine_id,
+            at=action.at,
+            correlation_id=action.correlation_id,
+            command=action.command,
+            user=action.user,
+            from_state=from_state,
+            to_state=action.to_state if result.changed else from_state,
+        )
+
+        # Re-stamp the FSM-generated events with the parent
+        # correlation_id so the entire chain — Requested → Dispatched
+        # → StateChanged → (Alarm*) — shares one trace key. The FSM
+        # uses field(default_factory=...) for correlation_id, so each
+        # event is a fresh dataclass instance whose attribute we can
+        # safely overwrite before persisting.
+        events: List[DomainEvent] = [dispatched]
+        for ev in result.events:
+            ev.correlation_id = action.correlation_id
+            events.append(ev)
+
+        # Atomic commit. On failure: exception propagates up to _run(),
+        # _state is NOT advanced, the outbox is not written, and
+        # nothing leaks to subscribers — the click effectively didn't
+        # happen, which is the right failure mode for a control surface.
+        self._store.append_many(events)
+
+        if result.changed:
+            self._state = action.to_state
+            self._last_alid = action.alid
+            # Reset heartbeat clock so we don't double-write a
+            # telemetry_history row immediately after the state change.
+            self._last_heartbeat_at = action.at
+
+        # Operator-hold transition — applied AFTER the commit so a
+        # failed append doesn't leave the actor wedged in a stale hold.
+        # Holding commands (PAUSE / STOP / ABORT) set the lock to the
+        # forced state. Releasing commands (START / RESUME / RESET)
+        # clear it, putting the tool back under sensor-driven control.
+        #
+        # We only flip the hold on a real transition — a no-op (e.g.
+        # RESUME on a tool that's already RUN) leaves the prior hold
+        # state alone. In practice pre-validation in CommandService
+        # should rule that out, but keeping the update conditional on
+        # `result.changed` means a defensive audit path can't
+        # accidentally unlock the tool.
+        if result.changed:
+            self._operator_hold = action.to_state if action.holds_state else None
+
+        log.info(
+            "actor %s: control %s applied from=%s to=%s changed=%s hold=%s corr=%s",
+            self._cfg.machine_id,
+            action.command,
+            from_state,
+            action.to_state,
+            result.changed,
+            self._operator_hold,
+            action.correlation_id,
+        )
 
     # ------------------------------------------------------------------
     # Heartbeat throttle — event-time gated so replays stay deterministic.

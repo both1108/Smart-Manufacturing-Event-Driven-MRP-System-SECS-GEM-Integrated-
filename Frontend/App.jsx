@@ -190,8 +190,15 @@ function classifyEvent(evt) {
       return { kind: 'CEID', stream: 'S6F11' };
     case 'MachineHeartbeat':
       return { kind: 'SVID', stream: 'S1F4' };
+    // Host-command lifecycle. All four ride S2F41 in the SECS map: the
+    // operator's intent (Requested), the actor's accept (Dispatched),
+    // the wire-level ack we'll wire up later (Acked), and the explicit
+    // refusal path (Rejected). Keeping them on one stream means the
+    // Event Log groups them together visually.
+    case 'HostCommandRequested':
     case 'HostCommandDispatched':
     case 'HostCommandAcked':
+    case 'HostCommandRejected':
       return { kind: 'INFO', stream: 'S2F41' };
     case 'MRPRecomputeRequested':
     case 'MRPPlanUpdated':
@@ -220,10 +227,14 @@ function describeEvent(evt) {
       const m = p.metrics || {};
       return `T=${fmtMetric('temperature', m.temperature)} V=${fmtMetric('vibration', m.vibration)} R=${fmtMetric('rpm', m.rpm)}`;
     }
+    case 'HostCommandRequested':
+      return `Host command ${p.command || ''} requested${p.user ? ' by ' + p.user : ''}${p.requested_to_state ? ' → ' + p.requested_to_state : ''}`;
     case 'HostCommandDispatched':
-      return `Host command ${p.command || ''} dispatched`;
+      return `Host command ${p.command || ''} dispatched · ${p.from_state || '?'} → ${p.to_state || '?'}`;
     case 'HostCommandAcked':
       return `Host command ${p.command || ''} acked · HCACK=${p.hcack ?? 0}`;
+    case 'HostCommandRejected':
+      return `Host command ${p.command || ''} REJECTED · ${p.reason || 'invalid state'}`;
     case 'MRPRecomputeRequested':
       return `MRP recompute requested${p.reason ? ' · ' + p.reason : ''}`;
     case 'MRPPlanUpdated':
@@ -766,5 +777,3 @@ function ControlPage({ equipment, selected, onSelect, onCommand, lastCommand }) 
     </div>
   );
 }
-
-Object.assign(window, { App });

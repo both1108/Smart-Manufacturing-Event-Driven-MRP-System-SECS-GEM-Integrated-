@@ -114,3 +114,67 @@ class MRPPlanUpdated(DomainEvent):
     suggested_po_qty: float = 0.0
     suggested_order_date: Optional[datetime] = None
     has_shortage: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Host-command events (Week 5+ — Remote Control panel)
+#
+# These three events make operator (or supervisory MES) intent observable
+# in the same audit trail as equipment-driven events. They model the
+# SEMI E30 §6.5 remote-command lifecycle:
+#
+#     Operator click  --HostCommandRequested-->   (intent captured)
+#                                                     |
+#                          + accepted by FSM ------> HostCommandDispatched
+#                                                     |
+#                                                     +--> StateChanged
+#                                                     +--> AlarmTriggered / AlarmReset
+#                          + rejected by FSM ------> HostCommandRejected
+#
+# All three carry the same correlation_id when they belong to the same
+# button click, so a UI drill-down can surface the full chain
+# "click → dispatch → state change → recovery" with one query.
+# ---------------------------------------------------------------------------
+@dataclass
+class HostCommandRequested(DomainEvent):
+    """Operator (or supervisory MES) submitted a SEMI E30 remote command.
+
+    Written synchronously by the route handler so the audit trail captures
+    intent even if the dispatch step fails downstream. In a real factory
+    this is the row a compliance auditor reads when asked "who told tool
+    M-01 to STOP at 14:32".
+    """
+    command: str = ""              # START / STOP / PAUSE / RESUME / RESET / ABORT
+    user: str = ""                 # X-User header from the dashboard / MES
+    requested_to_state: str = ""   # FSM state this command would drive towards
+
+
+@dataclass
+class HostCommandDispatched(DomainEvent):
+    """The actor accepted the command and applied the corresponding FSM
+    transition; the resulting StateChanged (and any AlarmTriggered /
+    AlarmReset) are appended in the same atomic event_store batch.
+
+    In a wire-level SECS host this is the moment we'd send S2F41 and
+    receive HCACK=0. The demo doesn't talk to a real tool — we apply the
+    state change directly, which is why this event lives next to the
+    Requested/Rejected pair rather than being deferred until ack."""
+    command: str = ""
+    user: str = ""
+    from_state: str = ""
+    to_state: str = ""
+
+
+@dataclass
+class HostCommandRejected(DomainEvent):
+    """Command refused — typically because the current state doesn't allow
+    it (e.g. STOP on an IDLE tool, or RESET on a healthy machine).
+
+    Carries the reason so the UI / audit layer can explain "why nothing
+    happened" without round-tripping back to the FSM rules. No state
+    change occurs, so no StateChanged follows — this is a terminal event
+    for that correlation_id."""
+    command: str = ""
+    user: str = ""
+    from_state: str = ""
+    reason: str = ""

@@ -48,6 +48,9 @@ from services.domain_events import (
     AlarmReset,
     AlarmTriggered,
     DowntimeClosed,
+    HostCommandDispatched,
+    HostCommandRejected,
+    HostCommandRequested,
     MachineHeartbeat,
     MRPPlanUpdated,
     MRPRecomputeRequested,
@@ -142,6 +145,12 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
     _bootstrapped = True
 
     # 1. Event-type registry (used by OutboxRelay to decode payload_json).
+    #
+    # The HostCommand* trio joins the registry here (Week 5+) so the
+    # outbox relay can decode them on its way to the bus. They're
+    # appended via EventStore.append_many like every other event, which
+    # means the Remote Control panel's clicks land in the same audit
+    # trail as equipment-driven events — no parallel write path.
     for cls in (
         StateChanged,
         AlarmTriggered,
@@ -150,6 +159,9 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
         DowntimeClosed,
         MRPRecomputeRequested,
         MRPPlanUpdated,
+        HostCommandRequested,
+        HostCommandDispatched,
+        HostCommandRejected,
     ):
         register_event_type(cls)
 
