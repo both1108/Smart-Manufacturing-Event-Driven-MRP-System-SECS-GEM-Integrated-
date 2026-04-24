@@ -37,12 +37,14 @@ services:
     # when you want the SECS-mode simulator. Paired with SIGNAL_SOURCE on the
     # app side: "secsgem" for authoritative, "both" for the parallel-run window.
     command: ["sh", "-c", "exec python -u ${SIMULATOR_ENTRYPOINT:-iot_simulator.py}"]
-    # Expose the two HSMS listeners so a host running on the docker host
+    # Expose the HSMS listeners so a host running on the docker host
     # (not inside the compose network) can also dial in — useful for local
     # testing against a standalone host harness.
+    # One port per machine: ETCH-01=5001, PVD-01=5002, CMP-01=5003.
     ports:
       - "5001:5001"
       - "5002:5002"
+      - "5003:5003"
     restart: unless-stopped
 
   mysql:

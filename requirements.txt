@@ -1,6 +1,13 @@
 # ---- runtime ---------------------------------------------------------------
 # HTTP + routing
 flask
+# CORS preflight/header handling for the static React dashboard. The UI is
+# served out of a separate origin (typically http://localhost:8000 from a
+# `python -m http.server` during dev, or a dedicated static host in prod),
+# so /api/* needs Access-Control-Allow-Origin on every response. Keeping
+# flask-cors as a runtime dep (not dev-only) because the dashboard is a
+# first-class consumer of the API, not just a test harness.
+flask-cors
 
 # -- Database drivers --
 # This system is intentionally a dual-database architecture with a

@@ -329,33 +329,61 @@ INSERT INTO purchase (part_no, delivery_date, order_qty, status) VALUES
   ('PART-C', CURDATE() - INTERVAL 2 DAY, 5, 'received');
 
 -- Insert machine capacity
+-- Three-tool small-fab cell:
+--   ETCH-01 produces PART-A (PART-A is the finished product's
+--           dominant item; etcher is the bottleneck for it)
+--   PVD-01  produces PART-B (deposition contributes PART-B)
+--   CMP-01  produces PART-D (final polish step for PART-D)
+-- Nominal_rate / efficiency are hand-tuned; in a real fab they'd come
+-- from the MES / CAPA study and update when OEE changes.
 INSERT INTO machine_capacity (machine_id, produces_part, nominal_rate, efficiency) VALUES
-  ('M-01', 'PART-A', 12.0, 0.95),
-  ('M-02', 'PART-B', 10.0, 0.90);
-  
--- Insert machine data
-INSERT INTO machine_data (machine_id, temperature, vibration, rpm, created_at) VALUES
-  ('M-01', 72.5, 0.0310, 1500, NOW() - INTERVAL 18 MINUTE),
-  ('M-01', 73.2, 0.0305, 1490, NOW() - INTERVAL 16 MINUTE),
-  ('M-01', 74.1, 0.0320, 1510, NOW() - INTERVAL 14 MINUTE),
-  ('M-01', 75.0, 0.0340, 1525, NOW() - INTERVAL 12 MINUTE),
-  ('M-01', 76.8, 0.0370, 1530, NOW() - INTERVAL 10 MINUTE),
-  ('M-01', 78.4, 0.0390, 1540, NOW() - INTERVAL 8 MINUTE),
-  ('M-01', 81.0, 0.0450, 1555, NOW() - INTERVAL 6 MINUTE),
-  ('M-01', 84.2, 0.0520, 1560, NOW() - INTERVAL 4 MINUTE),
-  ('M-01', 86.4, 0.0810, 1570, NOW() - INTERVAL 2 MINUTE),
-  ('M-01', 87.3, 0.0840, 1575, NOW() - INTERVAL 1 MINUTE),
+  ('ETCH-01', 'PART-A', 12.0, 0.95),
+  ('PVD-01',  'PART-B', 10.0, 0.92),
+  ('CMP-01',  'PART-D',  8.0, 0.90);
 
-  ('M-02', 70.8, 0.0290, 1450, NOW() - INTERVAL 18 MINUTE),
-  ('M-02', 71.9, 0.0310, 1460, NOW() - INTERVAL 16 MINUTE),
-  ('M-02', 73.6, 0.0340, 1470, NOW() - INTERVAL 14 MINUTE),
-  ('M-02', 77.2, 0.0410, 1490, NOW() - INTERVAL 12 MINUTE),
-  ('M-02', 82.5, 0.0550, 1510, NOW() - INTERVAL 10 MINUTE),
-  ('M-02', 85.9, 0.0790, 1520, NOW() - INTERVAL 8 MINUTE),
-  ('M-02', 88.1, 0.0830, 1535, NOW() - INTERVAL 6 MINUTE),
-  ('M-02', 89.0, 0.0860, 1540, NOW() - INTERVAL 4 MINUTE),
-  ('M-02', 83.3, 0.0600, 1515, NOW() - INTERVAL 2 MINUTE),
-  ('M-02', 79.5, 0.0440, 1495, NOW() - INTERVAL 1 MINUTE);
+-- Insert machine data
+-- Seed the last ~20 minutes per machine with realistic telemetry so
+-- the dashboard has something to render BEFORE the live simulator
+-- starts producing fresh samples. Numbers are hand-chosen to stay
+-- below alarm thresholds on most rows (safety margin = boring chart
+-- on open) with a gentle ramp near the end of ETCH-01 — hints that
+-- "something might be going on" without actually alarming at boot.
+INSERT INTO machine_data (machine_id, temperature, vibration, rpm, created_at) VALUES
+  -- ETCH-01: thermal-prone; gentle upward creep near t0
+  ('ETCH-01', 71.8, 0.0295, 1475, NOW() - INTERVAL 18 MINUTE),
+  ('ETCH-01', 72.1, 0.0300, 1480, NOW() - INTERVAL 16 MINUTE),
+  ('ETCH-01', 72.4, 0.0305, 1482, NOW() - INTERVAL 14 MINUTE),
+  ('ETCH-01', 72.9, 0.0310, 1485, NOW() - INTERVAL 12 MINUTE),
+  ('ETCH-01', 73.5, 0.0312, 1486, NOW() - INTERVAL 10 MINUTE),
+  ('ETCH-01', 74.2, 0.0318, 1488, NOW() - INTERVAL 8 MINUTE),
+  ('ETCH-01', 75.0, 0.0322, 1490, NOW() - INTERVAL 6 MINUTE),
+  ('ETCH-01', 75.8, 0.0326, 1491, NOW() - INTERVAL 4 MINUTE),
+  ('ETCH-01', 76.3, 0.0330, 1492, NOW() - INTERVAL 2 MINUTE),
+  ('ETCH-01', 76.6, 0.0332, 1493, NOW() - INTERVAL 1 MINUTE),
+
+  -- PVD-01: temp-alarmed but with visible rpm jitter (power instability look)
+  ('PVD-01', 67.9, 0.0248, 1492, NOW() - INTERVAL 18 MINUTE),
+  ('PVD-01', 68.2, 0.0252, 1512, NOW() - INTERVAL 16 MINUTE),
+  ('PVD-01', 67.8, 0.0247, 1488, NOW() - INTERVAL 14 MINUTE),
+  ('PVD-01', 68.5, 0.0251, 1515, NOW() - INTERVAL 12 MINUTE),
+  ('PVD-01', 68.0, 0.0249, 1495, NOW() - INTERVAL 10 MINUTE),
+  ('PVD-01', 68.3, 0.0253, 1520, NOW() - INTERVAL 8 MINUTE),
+  ('PVD-01', 67.7, 0.0246, 1487, NOW() - INTERVAL 6 MINUTE),
+  ('PVD-01', 68.4, 0.0251, 1516, NOW() - INTERVAL 4 MINUTE),
+  ('PVD-01', 68.1, 0.0250, 1498, NOW() - INTERVAL 2 MINUTE),
+  ('PVD-01', 68.2, 0.0251, 1505, NOW() - INTERVAL 1 MINUTE),
+
+  -- CMP-01: vibration-prone; everything else calm
+  ('CMP-01', 59.8, 0.0395, 1795, NOW() - INTERVAL 18 MINUTE),
+  ('CMP-01', 60.1, 0.0401, 1800, NOW() - INTERVAL 16 MINUTE),
+  ('CMP-01', 60.0, 0.0404, 1798, NOW() - INTERVAL 14 MINUTE),
+  ('CMP-01', 60.2, 0.0398, 1801, NOW() - INTERVAL 12 MINUTE),
+  ('CMP-01', 59.9, 0.0408, 1802, NOW() - INTERVAL 10 MINUTE),
+  ('CMP-01', 60.3, 0.0412, 1799, NOW() - INTERVAL 8 MINUTE),
+  ('CMP-01', 60.0, 0.0406, 1800, NOW() - INTERVAL 6 MINUTE),
+  ('CMP-01', 60.1, 0.0410, 1803, NOW() - INTERVAL 4 MINUTE),
+  ('CMP-01', 60.2, 0.0418, 1801, NOW() - INTERVAL 2 MINUTE),
+  ('CMP-01', 60.1, 0.0415, 1799, NOW() - INTERVAL 1 MINUTE);
 
   -- Insert demand forecast
 INSERT INTO demand_forecast (part_no, forecast_date, part_demand) VALUES
@@ -383,11 +411,15 @@ INSERT INTO demand_forecast (part_no, forecast_date, part_demand) VALUES
   ('PART-E', CURDATE() + INTERVAL 1 DAY, 5),
   ('PART-E', CURDATE() + INTERVAL 2 DAY, 6);
 
-  -- 🔥 TEST DATA: fake downtime (for testing pipeline)
+  -- 🔥 TEST DATA: fake downtime (for testing the MRP pipeline).
+-- Seeded against PVD-01/PART-B so the dashboard shows a "non-zero
+-- day" on first load rather than an empty MRP panel. Gets overwritten
+-- naturally once the simulator runs the storyline past the first
+-- AlarmReset → MRPPlanUpdated cycle.
 INSERT INTO machine_downtime_log
 (machine_id, start_time, end_time, reason, lost_qty, correlation_id)
 VALUES
-('M-02',
+('PVD-01',
  NOW() - INTERVAL 30 MINUTE,
  NOW() - INTERVAL 10 MINUTE,
  'ALARM',
@@ -397,7 +429,7 @@ VALUES
  INSERT INTO capacity_loss_daily
 (part_no, loss_date, lost_qty, machine_id, correlation_id)
 VALUES
-('PART-B', CURDATE(), 3.00, 'M-02', 'test-corr-001');
+('PART-B', CURDATE(), 3.00, 'PVD-01', 'test-corr-001');
 
 INSERT INTO mrp_plan_view
 (part_no, reason, horizon_start, horizon_end,

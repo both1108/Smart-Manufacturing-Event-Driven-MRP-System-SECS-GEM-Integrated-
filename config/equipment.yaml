@@ -1,13 +1,19 @@
 # ---------------------------------------------------------------------------
-# Equipment inventory for the Week 4 SECS/GEM host.
+# Equipment inventory for the SECS/GEM host.
 #
 # One entry per physical piece of equipment on the shop floor. In a
 # real deployment this list comes from the MES master data (or a
 # `machines` table); for the demo we keep it flat in YAML.
 #
 # Every entry here MUST correspond to a machine_id registered in
-# bootstrap.MACHINES and present in the machine_capacity table — the
-# MachineActorRegistry refuses signals for unknown machines by design.
+# config.machines.MACHINE_PROFILES and present in the machine_capacity
+# table — the MachineActorRegistry refuses signals for unknown machines
+# by design.
+#
+# Fleet (three-tool small-fab cell):
+#   ETCH-01  plasma etcher        — temperature-dominated telemetry
+#   PVD-01   deposition tool      — visible rpm (bias power) jitter
+#   CMP-01   polisher             — vibration-dominated telemetry
 #
 # HSMS connect modes:
 #   ACTIVE  = the host dials out to the equipment (typical for central MES)
@@ -18,8 +24,8 @@
 # network, so the host (app container) uses ACTIVE mode.
 # ---------------------------------------------------------------------------
 equipment:
-  - machine_id: M-01
-    description: "Stamping press, line A"
+  - machine_id: ETCH-01
+    description: "Plasma etcher, chamber 1"
     hsms:
       address: simulator       # docker-compose service name
       port: 5001
@@ -43,13 +49,33 @@ equipment:
       - ALARM_TRIGGERED
       - ALARM_RESET
 
-  - machine_id: M-02
-    description: "Stamping press, line B"
+  - machine_id: PVD-01
+    description: "PVD deposition tool, chamber 1"
     hsms:
       address: simulator
       port: 5002
       connect_mode: ACTIVE
       session_id: 2
+      t3_reply_s: 45
+      t5_connect_separation_s: 10
+      t6_control_transaction_s: 5
+      t7_not_selected_s: 10
+      t8_network_intercharacter_s: 5
+      linktest_interval_s: 30
+    subscribed_ceids:
+      - SAMPLE_REPORT
+      - MACHINE_STARTED
+      - MACHINE_STOPPED
+      - ALARM_TRIGGERED
+      - ALARM_RESET
+
+  - machine_id: CMP-01
+    description: "CMP polisher, head 1"
+    hsms:
+      address: simulator
+      port: 5003
+      connect_mode: ACTIVE
+      session_id: 3
       t3_reply_s: 45
       t5_connect_separation_s: 10
       t6_control_transaction_s: 5

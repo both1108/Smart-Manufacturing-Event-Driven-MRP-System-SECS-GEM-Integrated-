@@ -36,11 +36,13 @@ Process model:
 import asyncio
 import atexit
 import logging
+import os
 import signal
 import threading
 from typing import Any, Dict, Optional, Tuple
 
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 from bootstrap import (
     bootstrap_event_pipeline,
@@ -66,6 +68,56 @@ log = logging.getLogger("app")
 # Flask app (importable for gunicorn / tests)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# CORS — enable the React dashboard (served from a separate static origin)
+# to call the JSON API in this process.
+#
+# Scope is deliberately narrow:
+#   - Only /api/* resources get CORS headers. /healthz and /readyz are
+#     operator-facing probes; no browser should be calling them, and
+#     leaving them same-origin prevents an unrelated page from using
+#     them to fingerprint pipeline state.
+#   - Allowed origins are driven by the CORS_ORIGINS env var (comma
+#     separated) so prod can point at its real dashboard origin without
+#     a code change. The default covers the two addresses a dev hits
+#     in practice (127.0.0.1 and localhost on the static-server port),
+#     mirroring the http://localhost:8000 origin the frontend README
+#     documents.
+#   - supports_credentials stays False: the React client polls with
+#     `credentials: 'omit'` and we don't set cookies, so we don't need
+#     (and shouldn't advertise) credentialed CORS.
+#   - The alarm-ack endpoint sends an X-User header, which is a
+#     non-simple header and therefore triggers a preflight OPTIONS. We
+#     allow-list it here so the preflight response carries
+#     Access-Control-Allow-Headers: X-User.
+#
+# This is a transport-layer concern only — none of the request handlers,
+# payload shapes, or status codes change. Flask-CORS installs an
+# after_request hook plus an OPTIONS responder; every handler below
+# continues to see exactly the same request/response it did before.
+# ---------------------------------------------------------------------------
+_default_cors_origins = (
+    "http://localhost:8000,"
+    "http://127.0.0.1:8000,"
+    "http://localhost:5173,"   # Vite default, handy if someone moves off static hosting
+    "http://127.0.0.1:5173"
+)
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", _default_cors_origins).split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": _cors_origins}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-User"],
+    supports_credentials=False,
+    max_age=600,   # cache preflight for 10 min — the UI polls every 3 s
+)
+log.info("CORS enabled for /api/* origins=%s", _cors_origins)
+
 app.register_blueprint(dashboard_bp)
 app.register_blueprint(equipment_bp)
 app.register_blueprint(mrp_bp)

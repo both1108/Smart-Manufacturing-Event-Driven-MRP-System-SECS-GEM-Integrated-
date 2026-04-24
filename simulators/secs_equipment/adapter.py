@@ -19,6 +19,7 @@ import logging
 from typing import Dict, Iterable, Optional
 
 from services.secs.config import EquipmentConfig
+from simulators.scenario import ScenarioCoordinator
 from simulators.secs_equipment.equipment_session import EquipmentSession
 from simulators.secs_equipment.sensor_sim import (
     DEFAULT_STATE_BY_MACHINE,
@@ -35,7 +36,14 @@ class GemEquipmentAdapter:
         equipment: Iterable[EquipmentConfig],
         sample_period_s: float = 1.0,
         alarm_thresholds: Optional[dict] = None,
+        coordinator: Optional[ScenarioCoordinator] = None,
     ):
+        # Single coordinator shared across every session in this process.
+        # Critical: the "only one active victim at a time" invariant is
+        # enforced by this single instance. If two adapters each built
+        # their own coordinator, two machines could alarm concurrently
+        # and blow the demo storyline.
+        self._coordinator = coordinator or ScenarioCoordinator()
         self._sessions: Dict[str, EquipmentSession] = {}
         for cfg in equipment:
             sensor = self._initial_sensor_for(cfg.machine_id)
@@ -44,6 +52,7 @@ class GemEquipmentAdapter:
                 sensor=sensor,
                 sample_period_s=sample_period_s,
                 alarm_thresholds=alarm_thresholds,
+                coordinator=self._coordinator,
             )
         self._running = False
 

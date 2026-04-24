@@ -36,6 +36,7 @@ from config.secs_gem_codes import (
     CEID,
 )
 from services.secs.config import EquipmentConfig
+from simulators.scenario import ScenarioCoordinator
 from simulators.secs_equipment.sensor_sim import SensorState, update_sensor
 
 if TYPE_CHECKING:
@@ -54,10 +55,18 @@ class EquipmentSession:
         sensor: SensorState,
         sample_period_s: float = 1.0,
         alarm_thresholds: Optional[dict] = None,
+        coordinator: Optional[ScenarioCoordinator] = None,
     ):
         self._cfg = config
         self._sensor = sensor
         self._period_s = sample_period_s
+        # Coordinator is REQUIRED in practice — the adapter always
+        # provides one. It's Optional at the type level so unit tests
+        # that exercise HSMS wiring without physics can pass None and
+        # skip the sample loop (they call .start() with a no-op sensor).
+        # When None, update_sensor is never invoked because we build a
+        # private coordinator here rather than crash mid-tick.
+        self._coordinator = coordinator or ScenarioCoordinator()
         # Equipment-side thresholds are an opt-in feature. By default
         # the equipment emits raw samples only; the host FSM detects
         # alarms. When alarm_thresholds is provided, the equipment
@@ -303,7 +312,16 @@ class EquipmentSession:
     async def _sample_loop(self) -> None:
         while self._running:
             try:
-                update_sensor(self._sensor)
+                # The coordinator drives the storyline; sensor_sim applies
+                # drift+noise toward its phase targets. Keeping the two
+                # decoupled means the *same* coordinator also feeds the
+                # tailer-mode simulator (iot_simulator.py) without any
+                # SECS-specific wiring.
+                update_sensor(
+                    self._sensor,
+                    machine_id=self._cfg.machine_id,
+                    coordinator=self._coordinator,
+                )
                 self._emit_sample_report()
                 if self._alarm_thresholds:
                     self._check_and_emit_alarms()

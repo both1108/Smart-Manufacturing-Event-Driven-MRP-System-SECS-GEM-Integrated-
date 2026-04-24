@@ -24,6 +24,7 @@ Design notes:
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+from config.machines import get_machine_type
 from services.query.base import ReadQueryService
 from utils.clock import utcnow
 
@@ -68,6 +69,15 @@ class MachinesQueryService(ReadQueryService):
 
             result.append({
                 "machine_id":         mid,
+                # machine_type is pulled from the static fleet registry
+                # (config.machines.MACHINE_PROFILES). It's NOT a DB
+                # column — we deliberately don't persist tool class in
+                # any read model because the registry is the single
+                # source of truth; the UI chooses colour/icon off this.
+                # None for unknown IDs (not "UNKNOWN") so the JSON
+                # shape lets the UI distinguish "no profile" from "a
+                # tool type we just don't render yet".
+                "machine_type":       get_machine_type(mid),
                 "status":             row["state"],
                 "last_update":        _iso(row["last_event_at"]),
                 "active_alarm_count": int(active_count),
@@ -100,6 +110,10 @@ class MachinesQueryService(ReadQueryService):
 
         return {
             "machine_id":      status["machine_id"],
+            # Same registry lookup as list(); keeping the Monitor page
+            # shape parallel to the Dashboard grid means the UI can
+            # reuse its machine-type render logic on both screens.
+            "machine_type":    get_machine_type(status["machine_id"]),
             "status":          status["state"],
             "since":           _iso(status["since"]),
             "last_update":     _iso(status["last_event_at"]),

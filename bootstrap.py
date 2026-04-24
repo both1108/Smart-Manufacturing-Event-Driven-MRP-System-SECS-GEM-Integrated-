@@ -39,6 +39,7 @@ import logging
 from typing import Any, Dict
 
 from config import settings
+from config.machines import MACHINE_IDS
 from config.secs_gem_codes import ALID, ALID_TEXT
 from db.mysql import get_mysql_conn
 from repositories.machine_capacity_repository import MachineCapacityRepository
@@ -76,8 +77,11 @@ from services.secs import GemHostAdapter, load_equipment_config
 
 log = logging.getLogger(__name__)
 
-# Equipment registry — eventually this belongs in a `machines` table.
-MACHINES = ("M-01", "M-02")
+# Equipment registry — sourced from config.machines so every component
+# (actor registry, HSMS host, dashboard DTOs) sees the same fleet. The
+# hardcoded tuple that used to live here has moved to MACHINE_PROFILES
+# where it also carries per-tool personality (machine_type, baselines).
+MACHINES = MACHINE_IDS
 
 # Per-ALID mean-time-to-repair used for "projected_loss" recompute
 # requests. Hand-tuned; replace with a rolling median query over the
