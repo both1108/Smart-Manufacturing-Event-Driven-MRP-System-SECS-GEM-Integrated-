@@ -1,812 +1,276 @@
 # Smart Manufacturing Event-Driven MRP System
 
-> **SECS/GEM equipment events → production capacity → MRP → procurement decisions, in one auditable event pipeline.**
->
-> 從 SECS/GEM 設備事件 → 產線產能 → MRP → 採購決策，整合於同一條可追溯的事件流。
+> **A semiconductor-grade pipeline that turns equipment alarms into procurement decisions — automatically, auditably, and in seconds, not days.**
+
+📘 中文版：[README.zh-TW.md](README.zh-TW.md)
 
 ![Demo](demo.gif)
 
 ---
 
-## Project Overview
+## 1. Project Overview
 
-This project is a Smart Manufacturing Event-Driven MRP system. It connects three layers that are usually owned by three different teams in a real factory — **equipment**, **production**, and **business** — into a single event-driven pipeline.
+In a real fab, three teams own three different worlds:
 
-A SECS/GEM alarm on a tool becomes, deterministically and auditably, a recomputed MRP plan and a purchase recommendation, with one `correlation_id` linking the entire chain.
+- **Equipment engineers** watch tools, alarms, and SECS/GEM signals.
+- **Production planners** decide what each tool runs and when.
+- **Procurement** orders raw materials based on next month's plan.
 
-The architecture is event-store + transactional outbox + per-machine actor + finite state machine + CQRS read models, with a SECS/GEM HSMS host adapter speaking the actual fab-floor protocol.
+These three worlds rarely speak in real time. When a critical tool faults at 10:03 a.m., it's normal for procurement to learn about the production gap days later — once spreadsheets have been rebuilt and meetings have happened.
 
-### 中文 / Traditional Chinese
+This project closes that loop. A SECS/GEM alarm on a machine becomes, in seconds, a recomputed production plan and a purchase recommendation — with one traceable thread connecting the alarm to the order.
 
-這個專案是一套**事件驅動的智慧製造 MRP 系統**。它把工廠裡通常由三個不同團隊負責的三個層級 ——**設備層**、**生產層**、**業務層**—— 串成一條事件流。
-
-當機台發出 SECS/GEM 警報時，這條警報會被確定性地、且可追溯地轉換成一份重新計算過的 MRP 計畫與採購建議，整條因果鏈用同一個 `correlation_id` 串起來。
-
-系統架構由「事件儲存 (event store) + 交易外箱 (transactional outbox) + 每機台 actor + 有限狀態機 (FSM) + CQRS 讀模型」組成，並透過 SECS/GEM HSMS host adapter 直接以真正的廠房通訊協定接設備。
+It is not a CRUD demo. It is a working prototype of how a modern fab integrates **equipment → production → business** as one event-driven pipeline.
 
 ---
 
-## What Problem This Solves
+## 2. Why This System Exists
 
-In most factories, the equipment side, the production planning side, and the procurement side run on different systems with different data models. When a tool goes down, the planner finds out from a phone call, the buyer finds out from the planner, and by the time anyone reorders material, the line has already been starved.
+Modern semiconductor and electronics manufacturing runs on tight margins and tighter schedules. A single tool down for two hours can shift output for an entire week. Yet most factories still discover capacity loss the way they did decades ago: through morning meetings, manual reports, and follow-up emails.
 
-This project answers one question end-to-end:
+The result is a chronic problem:
 
-> **"When a tool alarms at 10:03, what should the buyer do, and why?"**
+- Procurement orders are based on **yesterday's plan**, not **today's reality**.
+- Capacity loss from equipment downtime takes hours or days to reach the planner's desk.
+- Alarm acknowledgements, operator interventions, and material shortages live in separate systems with no shared audit trail.
 
-The pipeline turns equipment events into business decisions without humans copy-pasting between systems, and leaves a query-able audit trail of every decision and its cause.
+This system exists to make that lag disappear. Every equipment event lands in one auditable stream. Every downstream decision — capacity recalculation, MRP recompute, procurement signal — is automatically derived from that stream and traceable back to the originating alarm.
 
-### 中文
+In one sentence: **the factory's nervous system, wired up properly.**
 
-在大部分的工廠裡，**設備端、生產規劃端、採購端**通常用三套不同的系統、三種不同的資料模型。當機台故障時，規劃人員是靠電話得知，採購人員是靠規劃人員得知 —— 等到真的下單補料時，產線早就已經缺料了。
+### Why SECS/GEM matters
 
-這個系統回答一個端到端的問題：
-
-> **「當機台在 10:03 觸發警報時，採購人員到底該做什麼？為什麼？」**
-
-整條 pipeline 把**設備事件**自動轉換成**業務決策**，不需要人工跨系統複製貼上，每個決策的成因都會被記錄下來，事後可以用 SQL 查詢回溯。
+SECS/GEM (SEMI E4/E5/E30) is the protocol semiconductor equipment actually speaks. It is not a vendor SDK or a REST API — it is the standardized language a $50M lithography tool uses to tell the host *"I just started a wafer," "I cleared an alarm," "I'm out of consumables."* Any system that wants to participate in a real fab has to speak it. This project does, end-to-end: HSMS transport, S6F11 collection events with CEIDs, S5F1 alarms, S2F41 host commands.
 
 ---
 
-## Real-World Use Case / Practical Value
+## 3. What Makes This Different
 
-This section is for readers who don't want to read code. It explains, in plain language, what this system actually does for the people who would use it.
+Most factory dashboards are read-only views over a database. This system is **event-driven from the floor up**:
 
-### Why SECS/GEM exists in real factories
-
-A modern semiconductor or electronics line has machines from many different vendors — Applied Materials, Lam, ASML, Tokyo Electron, and so on. Each tool measures temperature, vibration, throughput, and alarms in its own way. Without a common language, the factory's IT system would have to be re-coded for every new tool, and important signals would get lost in translation.
-
-**SECS/GEM is that common language.** It is a standard set of messages defined by SEMI (E4/E5/E30) that every fab-grade tool understands. Instead of writing custom integrations per vendor, the host system speaks SECS/GEM and any compliant tool plugs in. That is what `services/secs/host_adapter.py` does — it speaks the standard, so the rest of the system never has to know what brand the machine is.
-
-### What kind of data comes in from a machine
-
-Through the SECS/GEM channel (or, in the simpler IoT mode, through the database tailer), every tool continuously reports:
-
-- **Live sensor readings** — temperature, vibration, RPM, pressure
-- **State changes** — IDLE → RUN → ALARM → IDLE
-- **Alarm events** — alarm ID (ALID), alarm text (e.g. "Chamber overheat"), severity code (ALCD)
-- **Heartbeats** — periodic "I'm still alive" pings even when nothing has changed
-
-So the system always knows: which machine, in what state, with what sensor values, at what time.
-
-### A concrete example, end to end
-
-Imagine a real morning on the line:
-
-1. **08:14** — Machine M-02 (a coating tool that produces wafers used in PART-A) is running normally. Temperature 68°C, vibration steady.
-2. **08:31** — Vibration begins climbing. The chamber is heating up beyond spec.
-3. **08:33** — M-02 crosses the temperature threshold and triggers ALID 1001 ("Chamber overheat"). The tool sends an S6F11 alarm message to the host over SECS/GEM.
-4. **08:33** — The system records `AlarmTriggered{machine_id=M-02, alid=1001, ...}`. State changes from RUN to ALARM. A downtime row opens.
-5. **08:38** — Five seconds after the alarm settles, the system writes `MRPRecomputeRequested` for PART-A with a projected loss based on typical recovery time.
-6. **08:38** — `MRPRunner` simulates the next 30 days of inventory for PART-A, subtracting that capacity loss from incoming supply. It finds that on Wednesday next week, PART-A will be **~800 units short**.
-7. **08:38** — `MRPPlanUpdated` is emitted: `suggested_po_qty = 800, suggested_order_date = tomorrow` (lead time is 2 days).
-8. **08:38** — The dashboard now shows an alarm card on M-02, a red "shortage" indicator on PART-A, and a "Recommended PO: 800 units by tomorrow" callout.
-9. **09:20** — Maintenance fixes the overheat issue. M-02 transitions back to RUN. The downtime row closes with the actual lost time (47 minutes).
-10. **09:25** — A second MRP recompute runs with the **real** loss. Turns out the actual shortfall is 620, not 800. The dashboard updates the recommendation.
-11. **The buyer** sees one clear, traceable recommendation — not a flood of alarms. They place a 620-unit PO. The line never runs short.
-
-Without this system, that 47-minute outage would only be noticed by the person standing next to M-02 — and the procurement team would discover the resulting shortage the following week, after the line had already gone down for material.
-
-### Cause and effect, in one picture
-
-```
-machine overheats
-        │
-        ▼
-alarm fires (SECS/GEM S6F11)
-        │
-        ▼
-machine stops producing
-        │
-        ▼
-production capacity for PART-A drops today
-        │
-        ▼
-MRP recalculates → predicts shortage next Wednesday
-        │
-        ▼
-system suggests: order 620 units of PART-A by tomorrow
-        │
-        ▼
-buyer places PO with full traceability back to the alarm
-```
-
-### What outputs / predictions the system produces
-
-- **Live machine state** for every tool.
-- **Active alarms** with ALID, text, machine, and start time.
-- **Capacity loss per part per day** — how much output was actually lost.
-- **Future material shortage forecast** — when each part will run out.
-- **Purchase recommendations** — for each at-risk part: how much to order and by when.
-- **Audit trail** — every alarm, decision, and recommendation linked by a single ID, so any past decision can be explained later.
-
-### What decisions a user can make from this
-
-- **Operators** see "M-02 has been in alarm for 5 minutes, root cause is chamber overheat" and dispatch maintenance immediately, instead of walking the floor to check.
-- **Maintenance engineers** prioritize repairs by **business impact** — fix the tool that causes the biggest downstream shortage first.
-- **Production planners** see executable output (capacity-adjusted) versus market demand and can adjust customer commitments proactively, not after the fact.
-- **Buyers** receive a clear PO recommendation with quantity, date, and the alarm that caused it — not a gut feeling or a phone call from the planner.
-- **Plant managers** see fleet-wide health, recurring alarm patterns, and whether shortages keep coming back to the same part or the same tool.
-
-### Why each role wins
-
-| Role | What they get |
+| Typical factory app | This system |
 |---|---|
-| Operator | Fast, accurate alerts; one-click START / STOP from the dashboard with full audit. |
-| Maintenance engineer | A repair queue ordered by business impact, not just by alarm time. |
-| Production planner | A realistic plan that already accounts for today's downtime. |
-| Buyer | Concrete PO suggestions, with the cause and timestamp behind each one. |
-| Plant manager | A trustworthy fleet view; full root-cause traceability for any past decision. |
+| Polls a database every N seconds | Reacts to equipment events as they happen |
+| Equipment, production, ERP are separate apps | One pipeline, one audit log |
+| "Why was that PO raised?" → ask three teams | One `correlation_id` joins alarm → plan → PO |
+| Alarms are one screen; MRP is another | An alarm *causes* an MRP recompute; the link is in the data |
+| Adds a new dashboard = new schema, new query | Adds a new view = subscribe to existing events |
 
-### 中文 / 真實工廠的實際用途
-
-這一節是寫給「不想看程式碼」的讀者的。用白話解釋這套系統實際上幫使用者做了什麼。
-
-#### 為什麼工廠需要 SECS/GEM？
-
-一條真實的半導體或電子產線上，機台來自不同品牌（AMAT、Lam、ASML、TEL 等）。每家廠商的溫度、振動、報警格式都不一樣。如果沒有共同語言，工廠資訊系統每接一台新機台就要重寫整合程式，重要訊號也會在翻譯過程裡掉。
-
-**SECS/GEM 就是這個共同語言。** 它是 SEMI（E4/E5/E30）訂的一套標準訊息，每台「廠房等級」的機台都會講。本專案的 `services/secs/host_adapter.py` 就是負責跟設備講這個標準語言，下游程式完全不用管這台機是哪一家做的。
-
-#### 機台會送什麼資料進來？
-
-每台機台會持續送：
-
-- **即時感測值**：溫度、振動、轉速、壓力。
-- **狀態變化**：IDLE → RUN → ALARM → IDLE。
-- **警報事件**：警報編號（ALID）、警報文字（例如「Chamber overheat」）、嚴重度（ALCD）。
-- **心跳**：就算沒事也會定期送「我還活著」的訊號。
-
-所以系統隨時都知道：哪台機台、在什麼狀態、感測值多少、什麼時間。
-
-#### 一個具體的早晨情境
-
-1. **08:14** — M-02（鍍膜機，PART-A 的關鍵設備）正常運轉。
-2. **08:31** — 振動爬升、腔體過熱。
-3. **08:33** — M-02 觸發 ALID 1001「Chamber overheat」，透過 SECS/GEM S6F11 把警報送到 host。
-4. **08:33** — 系統記錄 `AlarmTriggered`，狀態 RUN → ALARM，停機紀錄開始計時。
-5. **08:38** — 警報穩定後 5 秒，系統用 MTTR 算出**預估產能損失**並觸發 MRP 重算。
-6. **08:38** — `MRPRunner` 模擬 PART-A 未來 30 天庫存，扣掉這次的損失，發現**下週三會缺 800 單位**。
-7. **08:38** — 系統發出 `MRPPlanUpdated` 建議：明天前下單 800 單位（PART-A lead time 2 天）。
-8. **08:38** — 儀表板顯示 M-02 警報卡、PART-A 紅色缺料、「建議 PO 800 單位」。
-9. **09:20** — 維修修好過熱問題，M-02 回到 RUN，停機紀錄關閉，實際停機 47 分鐘。
-10. **09:25** — 系統用**實際**損失再算一次，更新建議為 620 單位。
-11. **採購人員**看到的是一個有完整因果鏈的建議，不是一堆警報。下單 620 單位，產線不會缺料。
-
-沒有這套系統，這 47 分鐘的停機只有 M-02 旁邊的人會知道，採購團隊到下週才會發現缺料 —— 那時候產線已經因為缺料停下來了。
-
-#### 因果關係，一張圖看懂
-
-```
-機台過熱
-   │
-   ▼
-警報觸發（SECS/GEM S6F11）
-   │
-   ▼
-機台停止生產
-   │
-   ▼
-今天 PART-A 的產能下降
-   │
-   ▼
-MRP 重算 → 預測下週三缺料
-   │
-   ▼
-系統建議：明天前下單 PART-A 620 單位
-   │
-   ▼
-採購人員下單，且可一路追回到原警報
-```
-
-#### 系統會產生什麼預測 / 輸出？
-
-- 每台機台的即時狀態。
-- 進行中與近期警報。
-- 各料號每日的產能損失。
-- 未來的缺料預測（什麼時候會斷料）。
-- 採購建議（要下多少、什麼時候下）。
-- 完整稽核軌跡，可以追到每一個決策的成因。
-
-#### 使用者能做什麼決策？
-
-- **操作員**：看到「M-02 已 alarm 5 分鐘、原因是過熱」就立刻通報維修，不必親自跑現場確認。
-- **維修工程師**：依「下游缺料影響最大」的順序修，先修對採購最痛的那一台。
-- **生產規劃**：看到「市場需求 vs. 可執行產出」兩條曲線，提前跟客戶溝通承諾。
-- **採購人員**：收到帶有「為什麼」的 PO 建議，不是憑感覺、不是規劃打電話來。
-- **廠長 / 主管**：看 fleet view 與重複警報模式，做產線健康度管理。
-
-| 角色 | 得到的價值 |
-|---|---|
-| 操作員 | 即時準確的警示；儀表板上一鍵 START / STOP 並留下稽核紀錄。 |
-| 維修工程師 | 依照業務影響排序的維修優先順序。 |
-| 生產規劃 | 已經把今天停機算進去的可執行計畫。 |
-| 採購 | 具體的 PO 建議，且可追溯成因。 |
-| 廠長 | 可信賴的全廠視角，事後可追溯任何決策。 |
+The architectural choice — event sourcing with a transactional outbox, per-machine state machines, and projections instead of joins — comes from real fab MES patterns, not textbook examples.
 
 ---
 
-## System Benefits
-
-| Benefit | What it means in practice |
-|---|---|
-| **Equipment-to-business traceability** | Every purchase recommendation can be JOIN-ed back to the original alarm via `correlation_id`. |
-| **Capacity-aware planning** | MRP is run against forecast *minus actual capacity loss*, not against forecast alone. |
-| **Demand vs. executable output separated** | The dashboard shows market demand and capacity-adjusted producible output as two distinct curves. |
-| **Auditable by design** | The event store is append-only; replaying any decision is a SQL query against historical events. |
-| **Transport-agnostic equipment edge** | The same downstream pipeline accepts signals from the SECS/GEM HSMS adapter or the legacy IoT simulator behind a single feature flag. |
-| **Multi-instance safe write path** | The outbox uses `FOR UPDATE SKIP LOCKED`, so multiple app replicas can drain events in parallel without duplication. |
-
-### 中文
-
-| 系統效益 | 實際意義 |
-|---|---|
-| **設備到業務的追溯性** | 任何一筆採購建議都能用 `correlation_id` 反查到原始的設備警報。 |
-| **產能感知的規劃** | MRP 是用「預測 − 真實產能損失」來跑，不是只用預測。 |
-| **需求 vs. 可執行產出分離** | 儀表板把「市場需求」和「設備產能調整後的可生產量」分成兩條曲線。 |
-| **天生可稽核** | 事件儲存是 append-only，任何決策都能用 SQL 重放。 |
-| **設備接入不綁定協定** | 同一條下游 pipeline 可以接 SECS/GEM HSMS adapter，也可以接舊版 IoT 模擬器，用一個 flag 切換。 |
-| **多實例寫入安全** | Outbox 採用 `FOR UPDATE SKIP LOCKED`，多個 app replica 可以同時 drain 事件而不會重複。 |
-
----
-
-## Core Features
-
-- **SECS/GEM HSMS host** with one session per machine (`services/secs/`), decoding S6F11 events into typed domain events.
-- **Per-machine actor model** (`services/machine_actor.py`) — every machine has one mailbox, one consumer, no cross-machine races.
-- **Per-machine FSM** over `{IDLE, RUN, ALARM, UNKNOWN}` (`services/state_machine.py`).
-- **Event store + transactional outbox** in MySQL (`services/event_store.py`).
-- **Single-publisher outbox relay** with DLQ and retry (`services/outbox_relay.py`).
-- **Debounced two-phase MRP recomputation** — projected loss on alarm, reconciled loss on recovery (`services/subscribers/mrp_recompute_scheduler.py`).
-- **Capacity-adjusted MRP** consuming `capacity_loss_daily` from real downtime (`services/mrp_service.py`, `services/subscribers/capacity_tracker.py`).
-- **CQRS read models** (`machine_status_view`, `mrp_plan_view`) projected by subscribers (`services/subscribers/read_model_projector.py`).
-- **JSON API + React dashboard** reading exclusively from read models (`routes/`, `services/query/`, `Frontend/`).
-- **Operator command override** — manual state changes flow through the same actor mailbox as telemetry, so START/STOP clicks can never race against stale samples (`services/domain_events.py` host-command events, `services/machine_actor.py` `ControlAction`).
-
-### 中文
-
-- **SECS/GEM HSMS host**（`services/secs/`）：每台機台一條 session，把 S6F11 解碼成型別化的 domain event。
-- **Per-machine actor**（`services/machine_actor.py`）：每台機台一個信箱、一個消費者，跨機台不會 race。
-- **Per-machine FSM**（`services/state_machine.py`）：`{IDLE, RUN, ALARM, UNKNOWN}`。
-- **事件儲存 + 交易外箱**（`services/event_store.py`）：寫入 MySQL，append-only。
-- **單一發佈者 outbox relay**（`services/outbox_relay.py`）：含 DLQ 與重試。
-- **去抖動的兩階段 MRP 重算**（`services/subscribers/mrp_recompute_scheduler.py`）：警報時用預估損失先算，復歸時用實際損失再算一次。
-- **產能調整版 MRP**（`services/mrp_service.py`、`services/subscribers/capacity_tracker.py`）：從真實停機時間算出 `capacity_loss_daily` 餵給 MRP。
-- **CQRS 讀模型**（`services/subscribers/read_model_projector.py`）：`machine_status_view`、`mrp_plan_view`。
-- **JSON API + React 儀表板**：只讀讀模型，不直接 join 事件儲存（`routes/`、`services/query/`、`Frontend/`）。
-- **操作員手動覆寫**：人工 START/STOP 跟遙測共用同一個 actor 信箱，因此不會跟舊的遙測樣本搶 FSM。
-
----
-
-## System Architecture
+## 4. System Workflow
 
 ```
-                        ┌─ machine_data (legacy) ──── tailer ─┐
-[HSMS / SECS] ──► host_adapter ─────────────────────► EquipmentIngest
-                                                              │
-                                                              ▼
-                                                       MachineActorRegistry
-                                                              │
-                                                              ▼
-                                                       MachineActor (1 per tool)
-                                                              │  (FSM.advance)
-                                                              ▼
-                                          ┌── event_store + event_outbox ──┐
-                                          │      (single TX, append-only)  │
-                                          └────────────────┬───────────────┘
-                                                           ▼
-                                                   OutboxRelay (single publisher,
-                                                                FOR UPDATE SKIP LOCKED)
-                                                           │
-        ┌──────────────┬──────────────────┬────────────────┼──────────────────┐
-        ▼              ▼                  ▼                ▼                  ▼
-ReadModelProjector  CapacityTracker  MRPRecompute      MRPRunner         AlarmProjector
-                                     Scheduler         (subscribes to
-                                     (debounce)         MRPRecomputeRequested)
-                                          │                │
-                                          ▼                ▼
-                                   DowntimeClosed     MRPPlanUpdated
-                                          │                │
-                                          └─── event_store ◄┘
-                                                   │
-                                                   ▼
-                                             read models
-                                       (machine_status_view,
-                                        mrp_plan_view, etc.)
-                                                   │
-                                                   ▼
-                                          /api/* (Flask) ─► React dashboard
+   ┌────────────┐    SECS/GEM      ┌──────────────────┐
+   │  Equipment │  S6F11 / S5F1    │  Equipment Layer │
+   │   (Tools)  │ ───────────────▶ │  (HSMS adapter)  │
+   └────────────┘                  └────────┬─────────┘
+                                            │
+                                            ▼
+                                  ┌──────────────────┐
+                                  │   Event Store    │  ← single source of truth
+                                  │  + Outbox Relay  │     (audit-grade, replayable)
+                                  └────────┬─────────┘
+                                           │
+            ┌──────────────────┬───────────┼────────────┬───────────────┐
+            ▼                  ▼           ▼            ▼               ▼
+      Capacity            Alarm View   Live Charts   MRP Engine    Operator
+      Tracking           (acknowledged) (telemetry)  (recompute)   Commands
+            │                                            │
+            ▼                                            ▼
+     Downtime ledger                          Procurement Signals
+                                              (suggested PO + dates,
+                                               linked to the alarm)
 ```
 
-The architecture is event-driven on the write side and CQRS-style on the read side. Equipment transport is pluggable via a `SIGNAL_SOURCE` feature flag (`tailer | secsgem | both`) — the same downstream code is unchanged when you switch from the IoT simulator to real SECS/GEM.
-
-### 中文
-
-整體架構在**寫入端**是事件驅動，在**讀取端**是 CQRS 風格。設備接入透過 `SIGNAL_SOURCE` 旗標切換（`tailer | secsgem | both`），下游程式完全不需要改 —— 從 IoT 模擬器換成真實 SECS/GEM 只是設定切換。
+A SECS/GEM event enters from the left. Every downstream system — dashboards, capacity tracking, MRP, procurement — reacts to the same canonical event stream. There is no cross-team API call, no nightly batch job, no "we'll sync later."
 
 ---
 
-## End-to-End Flow
+## 5. Key Features
 
-1. **Equipment signal** arrives via the SECS/GEM HSMS host (`services/secs/host_adapter.py`) or the legacy database tailer (`services/machine_data_tailer.py`). Both call `EquipmentIngest.offer(RawEquipmentSignal)`.
-2. **Per-machine actor** consumes the signal, asks the FSM to advance, and on a real transition appends `[StateChanged, AlarmTriggered, AlarmReset, ...]` to `event_store + event_outbox` in **one MySQL transaction**.
-3. **Outbox relay** (the single publisher) drains rows under `FOR UPDATE SKIP LOCKED` and dispatches each event to subscribers via the in-process bus.
-4. **`CapacityTracker`** opens a row in `machine_downtime_log` when leaving RUN; closes it on return to RUN; computes `lost_qty = duration_hours × nominal_rate × efficiency`; emits `DowntimeClosed`.
-5. **`MRPRecomputeScheduler`** debounces `AlarmTriggered` and `DowntimeClosed` per part (5 s window), and writes an `MRPRecomputeRequested` event back into `event_store` with the original `correlation_id` chained.
-6. **`MRPRunner`** subscribes to `MRPRecomputeRequested`, runs `simulate_inventory_and_mrp(...)` against forecast minus capacity loss, persists per-day breakdown to `mrp_plan_history`, and emits `MRPPlanUpdated`.
-7. **Read-model projectors** maintain `machine_status_view`, `mrp_plan_view`, alarm read models, etc.
-8. **JSON API + React dashboard** read those views — never the audit log directly.
-
-The whole chain is JOIN-able by `correlation_id`:
-
-```sql
-SELECT alarm.occurred_at AS alarm_at,
-       alarm.machine_id,
-       JSON_EXTRACT(plan.payload_json, '$.suggested_po_qty')   AS qty,
-       JSON_EXTRACT(plan.payload_json, '$.suggested_order_date') AS po_date
-FROM event_store alarm
-JOIN event_store plan
-  ON plan.correlation_id = alarm.correlation_id
- AND plan.event_type = 'MRPPlanUpdated'
-WHERE alarm.event_type = 'AlarmTriggered'
-  AND alarm.occurred_at >= NOW() - INTERVAL 7 DAY;
-```
-
-### 中文
-
-1. **設備訊號**從 SECS/GEM HSMS host 進來（`services/secs/host_adapter.py`），或是舊版資料庫 tailer（`services/machine_data_tailer.py`）。兩條路徑都呼叫同一個 `EquipmentIngest.offer(RawEquipmentSignal)`。
-2. **Per-machine actor** 收到訊號，請 FSM 推進狀態。如果真的有狀態轉換，就把一批 `[StateChanged, AlarmTriggered, AlarmReset, ...]` 在**同一個 MySQL transaction** 中寫進 `event_store + event_outbox`。
-3. **Outbox relay**（唯一發佈者）以 `FOR UPDATE SKIP LOCKED` 抓 rows，透過 in-process bus 派發給訂閱者。
-4. **`CapacityTracker`** 在離開 RUN 時開一筆 `machine_downtime_log`；回到 RUN 時關閉並算出 `lost_qty = duration_hours × nominal_rate × efficiency`；發出 `DowntimeClosed`。
-5. **`MRPRecomputeScheduler`** 對 `AlarmTriggered` 與 `DowntimeClosed` 做 5 秒 per-part 去抖動，把 `MRPRecomputeRequested` 寫回 `event_store`，並把原警報的 `correlation_id` 串下來。
-6. **`MRPRunner`** 訂閱 `MRPRecomputeRequested`，跑 `simulate_inventory_and_mrp(...)`，把每日明細寫進 `mrp_plan_history`，發出 `MRPPlanUpdated`。
-7. **讀模型投影器**負責維護 `machine_status_view`、`mrp_plan_view` 等。
-8. **JSON API + React 儀表板**只讀這些 view，絕不直接掃稽核日誌。
-
-整條鏈用 `correlation_id` 一個 JOIN 就能串起來。
+- **Real-time equipment monitoring** — tool state, telemetry, alarms, and operator commands flow through one pipeline at the speed of the equipment itself.
+- **Full SECS/GEM transport** — HSMS host adapter speaks the same protocol used on real semiconductor fab floors (S6F11 collection events, S5F1 alarms, S2F41 host commands).
+- **Equipment-driven MRP** — when a tool goes down, the production plan adjusts automatically. The capacity loss, the affected parts, and the resulting shortage are all derived from events, not manual entry.
+- **Procurement signals with traceability** — every purchase recommendation links back, by `correlation_id`, to the exact alarm or downtime that caused it. SOX-grade audit by design.
+- **Operator remote control with audit** — START / STOP / PAUSE / RESUME / RESET / ABORT commands ride the same event log as equipment events. Who pressed what, when, on which tool — all queryable.
+- **Auditable acknowledgement** — alarm acks are domain events, not direct database edits. Rebuilding the alarm view from history reproduces every ack.
+- **CQRS read models** — the dashboard reads from purpose-built views (`machine_status_view`, `alarm_view`, `telemetry_history`, `mrp_plan_view`, `procurement_signals`) projected from the event stream. Fast queries, no joins on the hot path.
+- **Dead-letter queue + retry** — subscriber failures are surfaced, not swallowed. Bad handlers do not silently corrupt downstream state.
 
 ---
 
-## Technical Highlights
+## 6. Example Real-World Scenario
 
-| Pattern | Where it lives | What it gives you |
+It is 10:03 a.m. Tool **M-01** is running PART-A.
+
+1. **10:03:17** — M-01's coolant temperature crosses the threshold. The equipment emits S6F11 with CEID 1003 (`AlarmTriggered`) plus S5F1 (ALCD=128).
+2. **10:03:17.4** — The pipeline records the alarm in `event_store`, flips M-01 to `ALARM`, and opens a downtime interval.
+3. **10:03:17.6** — `MRPRecomputeScheduler` notes that PART-A is affected and queues a recompute (debounced to coalesce a burst of related alarms into one run).
+4. **10:03:22** — `MRPRunner` pulls the latest forecast and capacity-loss data, recomputes the 30-day plan, and writes `MRPPlanUpdated`.
+5. **10:03:22.1** — `ProcurementSignalProjector` writes a row to `procurement_signals`: *"Suggested PO of 3,200 units of RAW-X by 2026-05-12, because of capacity loss on PART-A."* The row's `correlation_id` is the same one stamped on the original alarm.
+6. **10:04** — A planner opens the dashboard. The procurement panel already shows the new signal. One click drills back through the chain: signal → MRP plan → downtime → originating alarm on M-01.
+7. **10:47** — A technician resets M-01. `AlarmReset` fires; the downtime closes; a *reconciled-loss* MRP recompute runs with the actual loss; the procurement signal updates.
+
+No spreadsheet was opened. No email was sent. The factory's records are accurate before the planner has finished their coffee.
+
+---
+
+## 7. Architecture Concept (High Level)
+
+The system follows three load-bearing patterns. Each is industry-standard but they are rarely combined in factory software.
+
+**Event sourcing.** Every fact is appended to `event_store`. State is rebuilt from the log. Read models are projections, not the source of truth. A bug from a week ago can be debugged by replaying the events.
+
+**Transactional outbox.** Events are committed to the database in the same transaction as the row that produced them. A separate relay then publishes them. There is no "we wrote it but never sent it" failure mode.
+
+**Per-machine actor + finite state machine.** Each tool has one in-process owner. The FSM owns transitions; the actor owns serialization. Two telemetry samples on the same tool can never race. SEMI E10 / E94 state semantics live in one place, not scattered across `if/elif` chains.
+
+These three together give the property the project promises: **every business decision can be traced, deterministically, back to the equipment event that caused it.**
+
+---
+
+## 8. UI / Dashboard Capabilities
+
+The dashboard is the operator-facing view of the same event stream the back end uses. It is not a separate database; it reads the projected views.
+
+- **Machine grid** — live state, current alarm, recent telemetry sample for every tool.
+- **Live charts** — per-machine temperature, vibration, RPM streaming from `telemetry_history`. New samples appear as events arrive.
+- **Alarms panel** — active alarms with severity, age, and acknowledgement status. One-click ack, captured as a `AlarmAcknowledged` event so the audit trail records it.
+- **Remote control** — START / STOP / PAUSE / RESUME / RESET / ABORT buttons per tool. Every click is a logged `HostCommandRequested` event, regardless of whether the FSM accepts the transition.
+- **MRP plan view** — current 30-day plan per part, with capacity loss highlighted.
+- **Procurement signals** — suggested POs, ordered by recency, each one linkable back to the alarm that caused it.
+
+---
+
+## 9. Event-Driven Manufacturing Flow
+
+A few facts about why event-driven is the right shape for a factory:
+
+- Equipment does not poll. A tool decides *when* to send `S6F11`. The host has to be ready when it arrives. Polling-based systems either miss events or wake up too often.
+- Causality is the unit that matters. A factory manager does not ask "what is the inventory?" — they ask "why is this part short?" Event chains answer that question by construction; relational queries answer it by reconstruction.
+- Bounded contexts have different rates. Equipment events arrive at 1–10 Hz. MRP runs once per recompute trigger. Procurement is reviewed once per shift. Trying to put all three on the same query path is what makes traditional factory software brittle.
+
+The event log is the spine that connects them at the speed each layer naturally moves at.
+
+---
+
+## 10. Technologies Used
+
+| Layer | Choice | Why |
 |---|---|---|
-| **Event-driven architecture** | `services/event_bus.py`, `services/domain_events.py`, every `services/subscribers/*.py` | A typed event stream replaces polling and scattered side effects. |
-| **Event store** | `services/event_store.py`, MySQL `event_store` table | Append-only audit log; rehydration of FSM state on startup. |
-| **Transactional outbox** | `event_store + event_outbox` written in one TX; `services/outbox_relay.py` is the only publisher | No "DB committed but message lost" failure mode. |
-| **`FOR UPDATE SKIP LOCKED`** | `EventStore.fetch_undispatched(...)` | Multi-replica relays drain the same outbox safely in parallel. |
-| **Per-machine actor model** | `services/machine_actor.py`, `services/machine_actor_registry.py`, `services/ingest.py` | Eliminates per-machine races; serializes telemetry and operator commands through one mailbox. |
-| **Finite state machine** | `services/state_machine.py` (`{IDLE, RUN, ALARM, UNKNOWN}` + `TransitionResult`) | Single owner of "what state is this tool in right now?" |
-| **SECS/GEM host adapter** | `services/secs/host_adapter.py`, `services/secs/session.py`, `services/secs/decoders.py`, `services/secs/config.py`, pinned to `secsgem>=0.3,<0.4` | Real HSMS transport, one session per machine, parallel `enable()` / `disable()` lifecycle. |
-| **Debounced MRP recomputation** | `services/subscribers/mrp_recompute_scheduler.py` | Alarm storms collapse into one MRP run per part per debounce window. |
-| **Two-phase MRP** | `projected_loss` (MTTR-based, optimistic) + `reconciled_loss` (post-recovery, actual) | Buyers get an early warning *and* a corrected number once the tool is back. |
-| **CQRS read models** | `services/subscribers/read_model_projector.py`, `alarm_projector.py`, `telemetry_projector.py`; views in `mysql/init.sql` | Dashboard is O(machines), not O(events). |
-| **Correlation ID tracing** | `DomainEvent.correlation_id` propagated through every event; `correlation_id` column on `equipment_events`, `machine_downtime_log`, `mrp_plan_history` | One JOIN reconstructs the full alarm → downtime → recompute → plan chain. |
-| **Capacity-adjusted MRP** | `services/subscribers/capacity_tracker.py` writes `capacity_loss_daily`; `services/mrp_service.simulate_inventory_and_mrp(...)` consumes it | Plans reflect the line that actually exists today, not the line on paper. |
-| **DLQ / retry semantics** | `services/event_store.py` (`event_dlq`, `mark_failed`, `move_to_dlq`); `services/outbox_relay.py` `MAX_ATTEMPTS=5` | A poison event never blocks the line; ops can replay later. |
-| **Operator command override** | `HostCommandRequested` / `HostCommandDispatched` / `HostCommandRejected` in `services/domain_events.py`; `ControlAction` shares the actor mailbox | Manual interventions are first-class auditable events with the same correlation properties. |
+| Equipment transport | **SECS/GEM (HSMS)** via `secsgem` | Industry-standard semiconductor protocol |
+| Application | **Python + Flask** | Mature ecosystem; matches MES vendor stack |
+| Persistence | **MySQL 8** | `FOR UPDATE SKIP LOCKED` for the outbox; fab-IT friendly |
+| Read side | **CQRS read models** in MySQL | Fast dashboard queries without joining the hot path |
+| Frontend | **React** (single-page dashboard) | Polls the JSON API; live charts via projection table |
+| Containerization | **Docker** + `docker-compose` | One-command local fab simulation |
+| Simulation | **Custom IoT simulator** + **SECS equipment simulator** | Run the whole pipeline without real hardware |
 
-### 中文
-
-| 技術 / Pattern | 在哪裡 | 解決了什麼 |
-|---|---|---|
-| **事件驅動架構** | `services/event_bus.py`、`services/domain_events.py`、所有 `services/subscribers/*.py` | 用型別化事件流取代 polling 與散落各處的副作用。 |
-| **事件儲存** | `services/event_store.py`、`event_store` 資料表 | Append-only 稽核日誌；啟動時重建 FSM。 |
-| **交易外箱** | `event_store + event_outbox` 同一 TX；`services/outbox_relay.py` 是唯一發佈者 | 不會發生「資料庫成功但訊息掉」這種典型分散式 bug。 |
-| **`FOR UPDATE SKIP LOCKED`** | `EventStore.fetch_undispatched(...)` | 多個 replica relay 可以同時 drain 同一個 outbox。 |
-| **Per-machine actor** | `services/machine_actor.py`、`services/ingest.py` | 消除單機台 race；遙測與操作員指令共用一個信箱。 |
-| **有限狀態機** | `services/state_machine.py` | 「這台機器現在到底什麼狀態」只有一個答案。 |
-| **SECS/GEM host adapter** | `services/secs/*`、pin 在 `secsgem>=0.3,<0.4` | 真實 HSMS 通訊；每台機台一條 session；平行 enable / disable。 |
-| **去抖動 MRP 重算** | `services/subscribers/mrp_recompute_scheduler.py` | 警報暴衝會被收斂成一次 MRP run。 |
-| **兩階段 MRP** | `projected_loss`（MTTR 估算）+ `reconciled_loss`（復歸後實際） | 採購端先收到預警，復歸後再收到校正值。 |
-| **CQRS 讀模型** | `services/subscribers/read_model_projector.py` 等 | 儀表板查詢是 O(machines)，不是 O(events)。 |
-| **Correlation ID 追溯** | `DomainEvent.correlation_id` | 警報 → 停機 → 重算 → 計畫，一個 JOIN 全部串起來。 |
-| **產能調整版 MRP** | `services/subscribers/capacity_tracker.py` + `services/mrp_service.py` | 計畫反映**今天實際存在的產線**，不是書面上的產線。 |
-| **DLQ / retry** | `event_dlq`、`MAX_ATTEMPTS=5` | 毒事件不會卡住整條線。 |
-| **操作員手動覆寫** | host-command events + `ControlAction` 共用 actor 信箱 | 人工介入也是有稽核紀錄的事件。 |
+The technology stack is deliberately conservative. Every piece of it would survive an internal review at a real semiconductor manufacturer.
 
 ---
 
-## Tech Stack
+## 11. Future Expansion Ideas
 
-| Layer | Tool |
-|---|---|
-| Language | Python 3 |
-| HTTP API | Flask + flask-cors |
-| Event pipeline | asyncio (in-process), threading (debouncer) |
-| ERP / manufacturing DB | MySQL 8 (event store, outbox, read models, ERP tables) |
-| Business / orders DB | PostgreSQL 15 (orders, demand history) |
-| MRP simulation | pandas |
-| Equipment protocol | `secsgem>=0.3,<0.4` (HSMS) |
-| Configuration | YAML (`config/equipment.yaml`), `python-dotenv` |
-| Frontend | React (static, served separately) + Plotly (legacy server-rendered dashboards) |
-| Containerization | Docker + docker-compose |
+The current pipeline is the spine. Realistic next steps that fit the same shape:
 
-### 中文
-
-| 層級 | 工具 |
-|---|---|
-| 語言 | Python 3 |
-| HTTP API | Flask + flask-cors |
-| 事件管線 | asyncio（同進程）、threading（去抖動器） |
-| ERP / 製造端 DB | MySQL 8（事件儲存、outbox、讀模型、ERP） |
-| 業務 / 訂單端 DB | PostgreSQL 15（訂單、需求歷史） |
-| MRP 模擬 | pandas |
-| 設備協定 | `secsgem>=0.3,<0.4`（HSMS） |
-| 設定 | YAML（`config/equipment.yaml`）、`python-dotenv` |
-| 前端 | React（靜態、獨立 origin）+ Plotly（舊版伺服器端儀表板） |
-| 容器化 | Docker + docker-compose |
+- **Lot genealogy** — `LotStarted` / `LotCompleted` events so an alarm ties to "the 47 wafers that were in M-01 between 10:03 and 10:47" — the answer to every recall.
+- **Predictive maintenance** — subscribe to telemetry, detect drift before the alarm fires, emit `RecipeDriftDetected`. Pre-alarm, not post-alarm.
+- **Shift-aware capacity** — efficiency by `(machine, day_of_week, hour)` rather than a single number per machine.
+- **OEE rollup** — `availability × performance × quality` projected daily from the existing event types — the chart factory managers actually want.
+- **Postgres procurement bridge** — push `MRPPlanUpdated` to a real ERP-side database for direct PO integration.
+- **Redis Streams or Kafka** — when the system grows past one team and one node, a real broker replaces the in-process bus without changing publishers or subscribers.
 
 ---
 
-## Current Capabilities
-
-What you can demonstrate end-to-end today:
-
-- **Two interchangeable equipment transports.** IoT simulator writes `machine_data` rows, picked up by `MachineDataTailer`. Or: SECS equipment containers expose HSMS on ports 5001–5003 and the host adapter pulls S6F11 into the same ingest queue. Switch via `SIGNAL_SOURCE`.
-- **State inference per machine.** Each tool has its own actor + FSM; transitions write `StateChanged`, `AlarmTriggered`, `AlarmReset` events.
-- **Capacity tracking with real downtime math.** Leaving RUN opens a downtime row; returning to RUN closes it with computed `lost_qty`.
-- **Two-phase MRP.** Projected loss fires shortly after the alarm (MTTR-based); reconciled loss fires after recovery with actuals — both with the same `correlation_id`.
-- **Material shortage + purchase recommendation.** `MRPPlanUpdated` carries `total_shortage_qty`, `earliest_shortage_date`, `suggested_po_qty`, `suggested_order_date` (lead-time aware).
-- **Dashboard / API visibility.** `/api/dashboard`, `/api/machines`, `/api/events`, `/api/alarms`, `/api/mrp` — all read from projected views, never the audit log live.
-- **Operator override.** Manual START/STOP from the dashboard goes through the actor mailbox and produces auditable host-command events.
-
-### 中文
-
-目前可以端到端 demo 的能力：
-
-- **兩種可互換的設備接入方式**：IoT 模擬器寫 `machine_data`、由 `MachineDataTailer` 抓；或 SECS 設備容器在 5001–5003 開 HSMS、由 host adapter 抓 S6F11。用 `SIGNAL_SOURCE` 切換。
-- **每台機台獨立狀態判斷**：每台機台都有自己的 actor + FSM；狀態轉換時寫 `StateChanged`、`AlarmTriggered`、`AlarmReset`。
-- **真實停機時數的產能追蹤**：離開 RUN 時開 downtime row、回到 RUN 時關閉並算 `lost_qty`。
-- **兩階段 MRP**：警報後短時間內先用預估損失算一次，復歸後再用實際損失算一次，兩次共用 `correlation_id`。
-- **缺料偵測 + 採購建議**：`MRPPlanUpdated` 帶 `total_shortage_qty`、`earliest_shortage_date`、`suggested_po_qty`、`suggested_order_date`（含 lead time）。
-- **儀表板與 API**：`/api/dashboard`、`/api/machines`、`/api/events`、`/api/alarms`、`/api/mrp` —— 全部從投影 view 讀。
-- **操作員手動覆寫**：儀表板上的 START / STOP 透過 actor 信箱送進來，留下可稽核的 host-command 事件。
-
----
-
-## How a User Interacts with the System
-
-The dashboard is the primary interface. A non-engineer user — operator, planner, or buyer — never has to read raw events or open a database. They see machine cards, alarm cards, plan cards, and recommendation cards.
-
-### What the dashboard shows
-
-- **Machine cards** — one per tool (M-01, M-02, M-03 in the demo). Each card shows current state (RUN / IDLE / ALARM), latest temperature / vibration / RPM, and how long the tool has been in this state.
-- **Alarm timeline** — recent alarms with ALID, alarm text, machine, time, and whether the alarm is still active.
-- **MRP plan** — for each part: forecast demand, capacity-adjusted output, projected shortage date, suggested PO quantity, and order-by date.
-- **Event feed** — a chronological list of every system event (state change, alarm, downtime closed, MRP recompute, plan updated). Each entry carries a `correlation_id` so you can trace any decision back to its cause.
-- **Health indicators** — pipeline health (`/healthz`, `/readyz`), DLQ status, recent failures.
-
-### What actions a user can take
-
-- **Start / Stop / Reset a machine** — operator override buttons. The click goes through the same actor mailbox as live telemetry, so a stale RUN sample cannot overwrite the manual command. Each click leaves an auditable `HostCommandRequested → HostCommandDispatched` (or `HostCommandRejected`) pair in the event log.
-- **Trigger a manual MRP recompute** — `POST /api/mrp/recompute` lets a planner force a recompute for a specific part (e.g. after a forecast revision arrives from sales).
-- **Drill into history** — click any alarm or any plan to see the full causal chain (alarm → downtime → recompute → plan) joined by `correlation_id`.
-- **Switch transport modes** — engineers can flip `SIGNAL_SOURCE` in the environment to choose between the IoT simulator path and the real SECS/GEM HSMS path. Useful for testing and for parallel-run cutover during deployment.
-
-### What insights the user gains
-
-- **Real-time alerts** — "M-02 has been in ALARM for 6 minutes, ALID 1001 (Chamber overheat)."
-- **Shortage warnings** — "PART-A will be 620 units short on 2026-05-06 because of today's M-02 downtime."
-- **Purchase recommendations** — "Order 620 units of PART-A by 2026-04-30 (lead time 2 days)."
-- **Causal traceability** — "This 620-unit PO recommendation comes from the M-02 alarm at 08:33 today; here is the full timeline."
-- **Operator confirmation** — "STOP command issued at 09:01 by user `wel`; tool is now IDLE; recorded in audit log."
-
-The principle is simple: **the dashboard tells the user what to do, and links each suggestion back to the reason for it.** The raw event log exists for engineers and post-mortems; everyday users never have to look at it.
-
-### 中文 / 使用者怎麼跟系統互動
-
-儀表板是主要介面。非工程背景的使用者（操作員、規劃師、採購）**永遠不需要看原始事件、不需要打開資料庫**。他們看到的就是機台卡、警報卡、計畫卡、建議卡。
-
-#### 儀表板上會看到什麼
-
-- **機台卡**：每台機台一張卡，顯示目前狀態（RUN / IDLE / ALARM）、最新溫度 / 振動 / RPM、停留在目前狀態多久。
-- **警報時間軸**：近期警報，含 ALID、警報文字、機台、時間、是否還在進行。
-- **MRP 計畫**：每個料號的預測需求、產能調整後可生產量、缺料日、建議 PO 數量與下單日。
-- **事件列**：時間順序列出所有事件（狀態變化、警報、停機關閉、MRP 重算、計畫更新），帶 `correlation_id` 可一路追溯。
-- **健康指標**：管線健康（`/healthz`、`/readyz`）、DLQ 狀態、近期失敗。
-
-#### 使用者可以做的動作
-
-- **啟動 / 停止 / 重置機台**：操作員按鈕走跟遙測同一個 actor 信箱，舊的遙測樣本無法蓋掉手動指令。每次點擊都留下可稽核的 `HostCommandRequested → HostCommandDispatched / Rejected`。
-- **手動觸發 MRP 重算**：`POST /api/mrp/recompute` 可讓規劃人員強制重算指定料號（例如業務剛改完預測）。
-- **追溯歷史**：點任一警報或計畫，可以跟著 `correlation_id` 一路追到原因。
-- **切換接入模式**：工程師可改 `SIGNAL_SOURCE`，在 IoT 模擬器與 SECS/GEM 之間切換（測試、平行驗證用）。
-
-#### 使用者得到什麼洞察
-
-- **即時警示**：「M-02 已經 ALARM 6 分鐘，ALID 1001（Chamber overheat）」。
-- **缺料警告**：「PART-A 在 2026-05-06 會缺 620 單位，原因是今天 M-02 停機」。
-- **採購建議**：「2026-04-30 前下單 PART-A 620 單位（lead time 2 天）」。
-- **因果追溯**：「這筆 620 單位的 PO 建議源自今天 08:33 的 M-02 警報，下面是完整時間軸」。
-- **操作員回饋**：「09:01 由 `wel` 下了 STOP 指令，目前 IDLE，已記錄」。
-
-原則很簡單：**儀表板告訴使用者該做什麼，並把每一個建議連回它的成因。** 原始事件日誌是給工程師與事後檢討用的，日常使用者完全不需要看。
-
----
-
-## Known Limitations
-
-This is a working demo / portfolio system, not a production deployment. Issues identified in `docs/2026-04-27_project_evolution_and_technical_achievements.md`:
-
-- **MRP recomputation still runs on the relay path.** `MRPRunner._on_recompute` is a synchronous subscriber called from inside `OutboxRelay._drain_once`. A slow simulation blocks dispatch for every other machine. The next upgrade (see Roadmap) is to move it to a persisted command queue + independent worker.
-- **`EventBus` swallows subscriber exceptions, but the outbox marks the event dispatched anyway.** `event_bus.py` catches and logs handler errors; the relay sees a clean return and acks. A failing `CapacityTracker` write can leave the audit log looking perfect while the downstream MRP impact is missing. Needs per-subscriber acknowledgment.
-- **`MachineHeartbeat` is stored in `event_store`.** At fleet scale this dominates the audit table with mostly-identical metric snapshots. Heartbeats should land in a separate telemetry table or time-series store.
-- **Debounce state is in-memory.** `MRPRecomputeScheduler` keeps `_pending` and `_timers` per process, so two app replicas would emit two `MRPRecomputeRequested` events with different `correlation_id`s. Needs persistence in MySQL.
-- **Postgres procurement projector is not wired yet.** The dual-DB split (MySQL ERP + Postgres business) exists in `requirements.txt` and `docker-compose.yml`, but no subscriber currently writes `MRPPlanUpdated` into a Postgres business-side table. The "equipment → business" bridge is half-built.
-- **Single-process Flask + asyncio.** `app.py` runs the event pipeline on a daemon thread; this works for one replica but does not safely scale behind `gunicorn --workers N`. HTTP and pipeline should be split into separate entrypoints before scale-out.
-- **No metrics / observability layer yet.** No Prometheus counters for `events_published_total`, `outbox_lag_seconds`, `dlq_depth`, `mrp_recompute_duration_seconds`. You can run this; you cannot yet operate it under SLOs.
-- **No event schema versioning.** `_decode` does `cls(**raw)` blind; adding a field to an existing event will break replay of old events.
-- **Demo-scale fixtures.** Three machines, one BOM, single-shift capacity. Realistic SECS/GEM scenarios (lot start/end, recipe drift, planned maintenance) are not modeled.
-
-### 中文 / 已知限制
-
-這是一個能跑、能 demo、能放履歷的系統，但**不是 production 部署**。`docs/2026-04-27_project_evolution_and_technical_achievements.md` 已記錄以下問題：
-
-- **MRP 重算還在 relay thread 上跑**：`MRPRunner._on_recompute` 是 `OutboxRelay._drain_once` 同步呼叫的訂閱者，慢的 MRP 模擬會卡住其他機台的事件派發。下一個重要升級就是把它搬到持久化命令佇列 + 獨立 worker。
-- **`EventBus` 會吞掉訂閱者例外，但 outbox 仍會標記為已派發**：`CapacityTracker` 寫失敗時稽核日誌看起來完美，但下游 MRP 影響其實沒寫到。需要 per-subscriber ack。
-- **`MachineHeartbeat` 存在 `event_store`**：放大規模後會把稽核表灌爆。應該另外放遙測表或 time-series store。
-- **去抖動狀態在記憶體裡**：`MRPRecomputeScheduler` 的 `_pending` / `_timers` 是 per-process 的，多 replica 部署會發出兩筆 `MRPRecomputeRequested` 並帶不同 `correlation_id`。要持久化到 MySQL。
-- **Postgres procurement projector 還沒接**：雙資料庫切分在 `requirements.txt` 和 `docker-compose.yml` 都已宣告，但目前沒有訂閱者把 `MRPPlanUpdated` 寫進 Postgres 業務端表。設備 → 業務的橋只蓋了一半。
-- **Flask + asyncio 同進程**：`app.py` 把事件管線跑在 daemon thread；單實例可以，但 `gunicorn --workers N` 後面不安全。HTTP 與管線應該拆兩個入口。
-- **還沒有監控 / 觀測層**：沒有 `events_published_total`、`outbox_lag_seconds`、`dlq_depth`、`mrp_recompute_duration_seconds` 等 Prometheus 指標。
-- **沒有事件 schema 版本控制**：`_decode` 直接 `cls(**raw)`，幫舊事件加欄位會破掉 replay。
-- **Demo 級別的 fixture**：三台機台、一張 BOM、單班產能。真實 SECS/GEM 場景（lot 開始/結束、配方漂移、計畫保養）尚未建模。
-
----
-
-## Future Improvements / Roadmap
-
-Listed in priority order. The first three are the core of the next architectural milestone.
-
-1. **Persisted `mrp_command_queue` table.** Replace the inline `MRPRunner` subscription with a durable queue row. Schema mirrors the outbox: `(id, part_no, reason, triggered_by, correlation_id, source_event_seq, enqueued_at, picked_at, picked_by, finished_at, attempts, last_error)`.
-2. **Independent `MRPWorker`.** Drains `mrp_command_queue` with the same `FOR UPDATE SKIP LOCKED` pattern, runs `simulate_inventory_and_mrp`, writes `MRPPlanUpdated` to `event_store`. The relay remains the single publisher.
-3. **Better subscriber failure handling.** Either re-raise from `EventBus.publish` (let the relay's existing retry/DLQ cover it), or add an `event_subscriber_offsets` table for per-subscriber ack.
-4. **Telemetry table or time-series store.** Route `MachineHeartbeat` to `machine_telemetry` (or InfluxDB / TimescaleDB on the Postgres side) instead of `event_store`.
-5. **Postgres procurement projector.** New `services/subscribers/procurement_projector.py` listens on `MRPPlanUpdated` and writes to a Postgres `purchase_recommendations(part_no, suggested_qty, suggested_date, correlation_id, source_alarm_correlation)` table — closing the equipment-to-business loop.
-6. **Metrics / observability.** Prometheus exporter for relay lag, DLQ depth, MRP latency, ingest queue depth. Grafana dashboards. Alert on `dlq_depth > 0`.
-7. **Production-grade deployment split.** Separate `worker.py` entrypoint from `app.py` so the HTTP side can scale with `gunicorn --workers N` while the pipeline runs as its own deployment.
-8. **More realistic SECS/GEM simulator scenarios.** Lot start/complete (S6F11 with `lot_id`), recipe drift, planned-maintenance windows, alarm severities tied to ALCD, multi-tool dependencies.
-9. **Event schema versioning.** Add `payload_version` per event; reject or migrate on mismatch in `_decode`.
-10. **OEE rollup as a read model.** `OEEDaily(machine_id, date, availability, performance, quality)` projected from `StateChanged`, `LotCompleted`, `AlarmTriggered`.
-
-### 中文 / 後續發展路線
-
-優先順序由高至低，前三項是下一個架構里程碑的核心：
-
-1. **持久化的 `mrp_command_queue`**：用一張 MySQL 表代替 `MRPRunner` 的同步訂閱。
-2. **獨立的 `MRPWorker`**：用 `FOR UPDATE SKIP LOCKED` drain `mrp_command_queue`，跑模擬，把 `MRPPlanUpdated` 寫回 `event_store`。
-3. **訂閱者失敗處理**：要嘛 `EventBus.publish` 改成重新拋出，要嘛加 `event_subscriber_offsets` 表做 per-subscriber ack。
-4. **遙測表 / time-series store**：把 `MachineHeartbeat` 從 `event_store` 拉出來。
-5. **Postgres procurement projector**：把 `MRPPlanUpdated` 投影到 Postgres `purchase_recommendations`，補上設備 → 業務的最後一段。
-6. **監控 / 觀測**：Prometheus + Grafana，監看 relay lag、DLQ 深度、MRP 延遲、ingest 佇列深度。
-7. **Production 部署切分**：`worker.py` 與 `app.py` 拆開。
-8. **更真實的 SECS/GEM 模擬場景**：lot 開始/結束、recipe drift、計畫保養、ALCD 嚴重度。
-9. **事件 schema 版本控制**：`payload_version` + 解碼期遷移。
-10. **OEE 讀模型**：`OEEDaily(machine_id, date, availability, performance, quality)`。
-
----
-
-## How to Run
+## 12. Quick Start
 
 ```bash
-git clone https://github.com/both1108/mrp-python.git
-cd mrp-python
+# 1. Spin up MySQL + Postgres + the simulator + the app
+docker compose up -d
 
-# macOS / Linux
-cp .env.example .env
+# 2. Watch the pipeline come alive
+docker compose logs -f app
 
-# Windows (CMD):
-copy .env.example .env
-
-docker compose up --build
+# 3. Open the dashboard
+# Frontend at http://localhost:8000  (Vite dev server: http://localhost:5173)
 ```
 
-Open the API in a browser:
+The simulator generates SECS/GEM traffic for three machines (M-01, M-02, M-03) producing PART-A and PART-B. Within seconds you should see live state on the dashboard, telemetry charts updating, and — once the simulator triggers an alarm — a procurement signal landing in the procurement panel.
 
-```
-http://localhost:5000
-```
-
-The React dashboard under `Frontend/` is served from a separate static origin during dev (typical: `python -m http.server 8000` from inside `Frontend/`). CORS is scoped narrowly to `/api/*`.
-
-### Equipment transport mode
-
-Set `SIGNAL_SOURCE` in `.env`:
-
-| Value | Meaning |
-|---|---|
-| `tailer` | Legacy IoT simulator → `machine_data` table → `MachineDataTailer` (default). |
-| `secsgem` | Real SECS/GEM HSMS host adapter → simulator containers on ports 5001–5003. |
-| `both` | Run both transports in parallel for migration / smoke testing. |
-
-When `SIGNAL_SOURCE=secsgem`, also set `SIMULATOR_ENTRYPOINT=-m simulators.secs_equipment.main` so the simulator container speaks SECS instead of writing to `machine_data`.
-
-### Example `.env`
-
-```env
-# MySQL (ERP + manufacturing event pipeline)
-MYSQL_HOST=mysql
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=root
-MYSQL_DB=erp
-
-# PostgreSQL (orders + business side)
-PG_HOST=postgres
-PG_PORT=5432
-PG_USER=user
-PG_PASSWORD=password
-PG_DB=transactions
-
-# Equipment transport
-SIGNAL_SOURCE=tailer
-# SIMULATOR_ENTRYPOINT=iot_simulator.py
-```
-
-### 中文 / 如何啟動
+To run from source instead of Docker:
 
 ```bash
-git clone https://github.com/both1108/mrp-python.git
-cd mrp-python
-
-# macOS / Linux
-cp .env.example .env
-
-# Windows（命令提示字元）：
-copy .env.example .env
-
-docker compose up --build
+pip install -r requirements.txt
+python app.py
 ```
 
-瀏覽器開：`http://localhost:5000`
+Tests:
 
-React 儀表板在 `Frontend/`，開發時建議獨立 origin（例如 `python -m http.server 8000`）。CORS 只開放給 `/api/*`。
-
-設備接入模式請在 `.env` 裡設 `SIGNAL_SOURCE`：`tailer`（預設）/ `secsgem`（真實 SECS/GEM）/ `both`（同時跑做平行驗證）。
-
----
-
-## API / Dashboard Overview
-
-All endpoints live under `/api/*` and read from CQRS read models. The React dashboard is the primary consumer.
-
-| Endpoint | Source / read model | What it returns |
-|---|---|---|
-| `GET /api/dashboard` | `services/query/dashboard_query.py` | Aggregated dashboard payload (summary cards, charts). |
-| `GET /api/machines` | `machine_status_view` via `services/query/machines_query.py` | Current state of every tool, last update time. |
-| `GET /api/events` | `event_store` (recent slice) via `services/query/events_query.py` | Recent equipment / business events for the timeline view. |
-| `GET /api/alarms` | alarm read model via `services/query/alarms_query.py` | Active and recent alarms with ALID / ALCD / ALARM_TEXT. |
-| `GET /api/mrp` | `mrp_plan_view` via `routes/mrp_routes.py` | Latest plan summary per part: shortage qty, suggested PO qty, suggested order date. |
-| `POST /api/mrp/recompute` | injects `MRPRecomputeRequested(reason="manual")` | Manual recompute trigger. |
-| `POST /api/equipment/.../command` | `services/query/command_service.py` → actor mailbox | Operator command (START/STOP) — produces auditable host-command events. |
-| `GET /healthz` / `GET /readyz` | `app.py` | Operator-facing process and pipeline-readiness probes. |
-
-### 中文
-
-所有端點都在 `/api/*` 之下，全部從 CQRS 讀模型讀資料。React 儀表板是主要消費者。
-
-| 端點 | 來源 / 讀模型 | 用途 |
-|---|---|---|
-| `GET /api/dashboard` | `services/query/dashboard_query.py` | 儀表板總覽資料。 |
-| `GET /api/machines` | `machine_status_view` | 各機台目前狀態。 |
-| `GET /api/events` | `event_store`（近期切片） | 設備 / 業務事件時間軸。 |
-| `GET /api/alarms` | 警報讀模型 | 進行中與最近警報，含 ALID / ALCD / 警報文字。 |
-| `GET /api/mrp` | `mrp_plan_view` | 各料號最新計畫摘要：缺料量、建議下單量、建議下單日。 |
-| `POST /api/mrp/recompute` | 注入 `MRPRecomputeRequested(reason="manual")` | 手動觸發重算。 |
-| `POST /api/equipment/.../command` | `command_service.py` → actor 信箱 | 操作員指令；會產生可稽核的 host-command 事件。 |
-| `GET /healthz` / `GET /readyz` | `app.py` | 程序與管線就緒探針。 |
-
----
-
-## Project Structure
-
-```
-.
-├── app.py                          # Flask + asyncio entrypoint
-├── bootstrap.py                    # Wires the entire event pipeline once at startup
-├── docker-compose.yml              # MySQL + Postgres + app + simulator
-├── requirements.txt
-├── .env.example
-│
-├── config/                         # equipment.yaml, secs_gem_codes.py, settings
-├── db/                             # MySQL / Postgres connection helpers
-├── mysql/init.sql                  # Schema: event_store, event_outbox, event_dlq,
-│                                   # machine_status_view, mrp_plan_view,
-│                                   # capacity_loss_daily, machine_downtime_log, ...
-├── postgres/init.sql               # Orders / business-side schema
-│
-├── repositories/                   # Pure data layer (no business logic)
-│   ├── erp_repository.py
-│   ├── equipment_event_repository.py
-│   ├── iot_repository.py
-│   ├── machine_capacity_repository.py
-│   ├── machine_downtime_repository.py
-│   ├── mrp_input_repository.py
-│   └── transaction_repository.py
-│
-├── services/
-│   ├── event_bus.py                # In-process pub/sub
-│   ├── event_store.py              # Event store + outbox + DLQ
-│   ├── outbox_relay.py             # Single publisher, FOR UPDATE SKIP LOCKED
-│   ├── domain_events.py            # Typed DomainEvent dataclasses
-│   ├── ingest.py                   # EquipmentIngest, RawEquipmentSignal
-│   ├── machine_actor.py            # Per-machine actor with mailbox
-│   ├── machine_actor_registry.py
-│   ├── machine_data_tailer.py      # Legacy IoT-table → ingest bridge
-│   ├── state_machine.py            # FSM
-│   ├── mrp_runner.py               # MRP simulation runner (subscriber today)
-│   ├── mrp_service.py              # Pure simulate_inventory_and_mrp(...)
-│   ├── secs/                       # SECS/GEM HSMS host adapter (Week 4)
-│   │   ├── host_adapter.py
-│   │   ├── session.py
-│   │   ├── decoders.py
-│   │   └── config.py
-│   ├── subscribers/
-│   │   ├── capacity_tracker.py
-│   │   ├── mrp_impact_handler.py
-│   │   ├── mrp_recompute_scheduler.py
-│   │   ├── read_model_projector.py
-│   │   ├── alarm_projector.py
-│   │   └── telemetry_projector.py
-│   └── query/                      # Read-side query services
-│
-├── routes/                         # Flask blueprints (/api/*)
-├── simulators/secs_equipment/      # SECS/GEM equipment-side simulator
-├── iot_simulator.py                # Legacy IoT simulator (writes machine_data)
-├── Frontend/                       # React dashboard
-└── docs/
-    └── 2026-04-27_project_evolution_and_technical_achievements.md
+```bash
+pytest tests/
 ```
 
-### 中文 / 專案結構
+---
 
-主要分四層：
-- **`repositories/`** —— 純資料存取，無商業邏輯。
-- **`services/`** —— 事件管線、actor、FSM、SECS/GEM、MRP、訂閱者、讀側查詢。
-- **`routes/`** —— Flask blueprint，對外 `/api/*`。
-- **`Frontend/`** —— React 儀表板，獨立 origin。
+## 13. Screenshots
 
-設定與資料庫初始化：`config/`、`mysql/init.sql`、`postgres/init.sql`、`docker-compose.yml`、`.env.example`。
+> Replace these placeholders with actual screenshots when ready.
+
+- **Dashboard overview** — `docs/screenshots/dashboard.png`
+- **Live telemetry chart** — `docs/screenshots/telemetry.png`
+- **Alarms panel + acknowledge flow** — `docs/screenshots/alarms.png`
+- **MRP plan view** — `docs/screenshots/mrp.png`
+- **Procurement signals (with traceability)** — `docs/screenshots/procurement.png`
+- **System flow diagram** — [`system_flow.png`](system_flow.png)
 
 ---
 
-## Why This Project Matters
+## 14. For Recruiters / HR
 
-This is **not a generic ERP/MRP demo**. The interesting claim it makes — and substantiates in code — is:
+If you are reading this without a manufacturing background:
 
-> **Equipment-level events can drive procurement decisions, deterministically and auditably, in one event-driven pipeline.**
+This project is the kind of thing that runs inside a real semiconductor or electronics factory — not a school assignment, not a CRUD app. It connects three completely different worlds (machines, production planning, purchasing) into one live system.
 
-A SECS/GEM alarm at 10:03 on M-02 produces `AlarmTriggered` → `DowntimeClosed` → `MRPRecomputeRequested` → `MRPPlanUpdated` → a row in the dashboard, all sharing one `correlation_id`. Every step is durable in the event store, every step is replayable, every step is JOIN-able by SQL. That is the entire equipment → production → business chain that real factories struggle to keep coherent across three teams.
+What that means in practice:
 
-The project also demonstrates senior-level architectural decisions worth defending in a system-design interview:
-- Why an **event store + outbox** is mandatory (not optional) for a system where "alarm in DB but not delivered to MRP" is a correctness bug, not a degraded state.
-- Why **one actor per machine** is the right concurrency model for equipment, not threads or shared state.
-- Why **CQRS read models** matter the moment a dashboard exists — you cannot serve a fleet view from an audit log.
-- Why **`FOR UPDATE SKIP LOCKED`** is the multi-instance safety net that lets the system grow past one replica.
-- Why **debounced two-phase MRP** is the right trade-off between alarm-time prediction and recovery-time correction.
-- Why **in-process pub/sub** is the correct choice *today* (single team, one line) and Redis/Kafka would be premature — and what specifically would justify the migration later.
+- **It listens to factory equipment in real time** using the same protocol semiconductor fabs actually use.
+- **When a machine breaks, the system automatically figures out** how much production will be lost and recommends adjusting purchasing accordingly.
+- **Every decision can be traced back** to the original equipment event that triggered it — the kind of audit trail regulated industries require.
+- **It runs as one continuous pipeline**, not a collection of disconnected screens, which is a meaningful architectural choice.
 
-The documents under `docs/` and `SECSGEM/` (architecture reviews, code review, achievements summary) record both what was built and what remains intentionally unfinished, so the system can be read and extended honestly.
-
-### 中文 / 為什麼這個專案重要
-
-這**不是又一個 ERP/MRP demo**。它真正主張、而且用程式碼證明的是：
-
-> **設備層級的事件可以確定性地、且可稽核地驅動採購決策，全部在同一條事件驅動 pipeline 裡。**
-
-當機台 M-02 在 10:03 觸發 SECS/GEM 警報，事件鏈會產生 `AlarmTriggered` → `DowntimeClosed` → `MRPRecomputeRequested` → `MRPPlanUpdated` → 儀表板上的一列，全部共用一個 `correlation_id`。每一步都寫進事件儲存、可以重放、可以 SQL JOIN。這就是真實工廠裡最難跨三個部門維持一致的「設備 → 生產 → 業務」全鏈路。
-
-同時，這個專案展現了能在系統設計面試裡站得住腳的資深級決策：
-- 為什麼**事件儲存 + outbox** 在「警報落 DB 但沒派給 MRP」屬於正確性 bug 的系統裡是必要的，不是 nice-to-have。
-- 為什麼**一台機台一個 actor** 是設備層的正確併發模型，而不是 thread + shared state。
-- 為什麼有了儀表板就一定需要 **CQRS 讀模型** —— 你不能用稽核日誌服務 fleet view。
-- 為什麼 **`FOR UPDATE SKIP LOCKED`** 是讓系統可以長到多 replica 的安全網。
-- 為什麼**去抖動的兩階段 MRP** 是「警報期預測」與「復歸期校正」之間的正確折衷。
-- 為什麼**同進程 pub/sub** 在這個階段是對的，而 Redis/Kafka 是過早優化 —— 以及未來什麼條件才值得遷移。
-
-`docs/` 與 `SECSGEM/` 下的架構審查、程式碼審查、技術成就總結，誠實地紀錄了**已完成的部分**與**刻意尚未完成的部分**，方便後續閱讀與延伸。
+The author built this end-to-end: the equipment-side protocol layer, the event-driven middle, the production-planning logic, and the operator-facing dashboard. Each layer is built the way a senior manufacturing-systems engineer would build it.
 
 ---
 
-*Documentation last updated: 2026-04-27. See `docs/2026-04-27_project_evolution_and_technical_achievements.md` for the full evolution timeline and technical achievement summary.*
+## 15. For Engineering Managers
+
+The interesting parts of this codebase, in order of what tells you most about the engineer:
+
+1. **Event store + transactional outbox** (`services/event_store.py`, `services/outbox_relay.py`). `FOR UPDATE SKIP LOCKED` for multi-relay safety. Failed publishes increment attempts and demote to a DLQ at the cap. The outbox is the single publisher of the bus — there is no second write path.
+2. **Per-machine actor + FSM** (`services/machine_actor.py`, `services/state_machine.py`). One mailbox per tool, no shared mutable state. The FSM transition table is data, not branches. Heartbeats are time-gated against event time, not wall-clock, so replays are deterministic.
+3. **EventBus contract** (`services/event_bus.py`). Subscriber failures are aggregated and re-raised — the relay treats them as retryable. Silent corruption is impossible by construction; this is the contract that lets every other property of the system be trusted.
+4. **CQRS read models** (`services/subscribers/`). Each projector owns one view. The projectors are idempotent on replay (time-gated upserts, INSERT IGNORE, unique correlation IDs).
+5. **Procurement signal projector** (`services/subscribers/procurement_signal_projector.py`). The "equipment → business" claim made concrete: one MRPPlanUpdated → one row in `procurement_signals`, keyed by `correlation_id` so the SQL chain back to the originating alarm is one JOIN.
+6. **Auditable host commands** (`services/application/command_service.py`). Operator clicks generate `HostCommandRequested` → `HostCommandDispatched | HostCommandRejected` with a shared correlation ID. The audit log includes intent, even on rejection.
+
+The repository also carries scheduled architecture reviews under `SECSGEM/architecture_review_*.md` — these document the design's evolution and the trade-offs taken.
+
+---
+
+## 16. Resume-Friendly Highlights
+
+- Built an event-driven manufacturing pipeline that turns SECS/GEM equipment alarms into auditable MRP and procurement decisions, end-to-end.
+- Implemented a transactional outbox + dead-letter queue + per-subscriber retry, so subscriber failures never silently corrupt downstream state.
+- Designed per-machine actors with an explicit finite state machine modelling SEMI E10 / E94 state semantics — including operator override that respects safety alarms.
+- Closed the equipment → production → business audit chain with a single `correlation_id` propagating through every event from alarm to purchase recommendation.
+- Modeled SECS/GEM transport (HSMS, S6F11, S5F1, S2F41) end-to-end, with a swappable signal-source layer for legacy database tailers vs real-fab transport.
+- Shipped a CQRS read-model layer (`machine_status_view`, `alarm_view`, `telemetry_history`, `mrp_plan_view`, `procurement_signals`) so the dashboard never joins on the hot path.
+- Authored architecture reviews critiquing the design's own weaknesses — silent-failure modes, multi-instance debounce races, missing business-side projectors — and shipped fixes that closed each one.
+
+---
+
+📘 中文版說明請見 [README.zh-TW.md](README.zh-TW.md)
