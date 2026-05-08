@@ -20,10 +20,19 @@ def _new_correlation_id() -> str:
 
 @dataclass
 class DomainEvent:
-    """Base class — every event carries machine, time, correlation id."""
+    """Base class — every event carries machine, time, correlation id.
+
+    Optional ``dedup_key`` (added 2026-05-04) makes producer-side
+    idempotency a first-class property of the event. When set, the
+    event_store enforces UNIQUE(event_type, dedup_key); duplicate
+    appends are rejected by the DB rather than relying on in-process
+    locks. Used by debouncing producers like MRPRecomputeScheduler so
+    two app instances racing on the same trigger window emit one event.
+    """
     machine_id: str
     at: datetime
     correlation_id: str = field(default_factory=_new_correlation_id)
+    dedup_key: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -177,4 +186,27 @@ class HostCommandRejected(DomainEvent):
     command: str = ""
     user: str = ""
     from_state: str = ""
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Operator-action events (Week 6+ — alarm acknowledgment audit)
+# ---------------------------------------------------------------------------
+@dataclass
+class AlarmAcknowledged(DomainEvent):
+    """An operator (or supervisory MES) acknowledged a specific alarm.
+
+    Manufacturing meaning: 'I, user X, saw this alarm at time T.' This
+    is audited in regulated fabs (E10/E94) — who, when, for which
+    (machine, alid). Modelling it as a domain event (rather than a
+    direct UPDATE on alarm_view) keeps the read model rebuildable from
+    event_store and lets future subscribers react: Slack / PagerDuty
+    close, MTTA (mean-time-to-acknowledge) rollup, ERP downtime ticket
+    update.
+
+    Idempotency: first-ack-wins is enforced by the projector against
+    alarm_view; replays of the same event do not overwrite the ack.
+    """
+    alid: int = 0
+    acknowledged_by: str = ""
     reason: str = ""

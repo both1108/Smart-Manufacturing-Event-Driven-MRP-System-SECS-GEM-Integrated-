@@ -56,6 +56,7 @@ from routes.equipment_routes import equipment_bp
 from routes.events_routes import events_bp
 from routes.machines_routes import machines_bp
 from routes.mrp_routes import bp as mrp_bp
+from routes.procurement_routes import procurement_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,6 +128,10 @@ app.register_blueprint(mrp_bp)
 app.register_blueprint(machines_bp)
 app.register_blueprint(alarms_bp)
 app.register_blueprint(events_bp)
+# Procurement signals (added 2026-05-04). One row per MRPPlanUpdated,
+# correlation_id chained back to the originating alarm — the HTTP
+# face of the equipment → business audit chain.
+app.register_blueprint(procurement_bp)
 
 
 @app.get("/healthz")

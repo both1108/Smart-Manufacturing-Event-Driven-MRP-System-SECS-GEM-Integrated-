@@ -133,10 +133,18 @@ CREATE TABLE IF NOT EXISTS event_store (
     occurred_at     DATETIME(6)  NOT NULL,
     payload_json    JSON         NOT NULL,
     written_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    -- Optional idempotency key (added 2026-05-04). Populated by event
+    -- producers that want cross-process dedup, e.g. MRPRecomputeScheduler
+    -- emits one recompute per (part_no, debounce_window) regardless of
+    -- how many app instances see the same trigger. NULL for events that
+    -- don't need dedup — MySQL's unique index ignores NULLs by default,
+    -- so unconstrained events still insert freely.
+    dedup_key       VARCHAR(128) NULL,
     PRIMARY KEY (event_seq),
     KEY ix_machine_seq (machine_id, event_seq),
     KEY ix_corr        (correlation_id),
-    KEY ix_type_time   (event_type, occurred_at)
+    KEY ix_type_time   (event_type, occurred_at),
+    UNIQUE KEY ux_dedup (event_type, dedup_key)
 ) ENGINE=InnoDB;
 
 -- Event Outbox
@@ -151,6 +159,27 @@ CREATE TABLE IF NOT EXISTS event_outbox (
     CONSTRAINT fk_outbox_store FOREIGN KEY (event_seq)
         REFERENCES event_store(event_seq),
     KEY ix_undispatched (dispatched_at, attempts)
+) ENGINE=InnoDB;
+
+-- Procurement signals (added 2026-05-04 — closes equipment → business).
+-- Written by ProcurementSignalProjector on MRPPlanUpdated. One row per
+-- (correlation_id) so the dashboard / ERP integration can drill from
+-- a purchasing suggestion all the way back to the originating alarm
+-- (correlation_id chains: alarm → recompute → plan → this row).
+CREATE TABLE IF NOT EXISTS procurement_signals (
+    id                       BIGINT       NOT NULL AUTO_INCREMENT,
+    correlation_id           CHAR(36)     NOT NULL,
+    part_no                  VARCHAR(50)  NOT NULL,
+    reason                   VARCHAR(32)  NOT NULL,
+    suggested_po_qty         DECIMAL(14,4) NOT NULL DEFAULT 0,
+    suggested_order_date     DATE         NULL,
+    earliest_shortage_date   DATE         NULL,
+    has_shortage             TINYINT(1)   NOT NULL DEFAULT 0,
+    generated_at             DATETIME(6)  NOT NULL,
+    created_at               DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY ux_corr (correlation_id),    -- idempotent on replay
+    KEY ix_part_date (part_no, generated_at)
 ) ENGINE=InnoDB;
 
 -- Dead-letter (optional but recommended):

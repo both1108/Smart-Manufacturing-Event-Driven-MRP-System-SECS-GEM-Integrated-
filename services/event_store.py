@@ -20,6 +20,8 @@ from dataclasses import asdict, fields
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Type
 
+import pymysql
+
 from services.domain_events import DomainEvent
 
 log = logging.getLogger(__name__)
@@ -28,6 +30,14 @@ log = logging.getLogger(__name__)
 # Populated by register_event_type() so the relay can reconstruct
 # DomainEvent subclasses from JSON without importing them everywhere.
 EVENT_TYPES: Dict[str, Type[DomainEvent]] = {}
+
+
+class DuplicateEventError(Exception):
+    """Raised when ``append_many`` hits a UNIQUE(event_type, dedup_key)
+    collision. Producers that opt into dedup (MRPRecomputeScheduler)
+    handle this as expected behaviour — "another instance got there
+    first." Producers that don't set dedup_key will never see it.
+    """
 
 
 def register_event_type(cls: Type[DomainEvent]) -> Type[DomainEvent]:
@@ -70,6 +80,19 @@ class EventStore:
 
     # -- writes --------------------------------------------------------
     def append_many(self, events: Iterable[DomainEvent]) -> List[int]:
+        """Append events as a single transaction (event_store + outbox).
+
+        Returns the list of new event_seq values, one per event. If the
+        whole batch contains an event whose ``dedup_key`` collides with
+        an existing row, the entire transaction rolls back and we raise
+        ``DuplicateEventError`` so the producer can decide what to do
+        (the typical answer: log + skip — that's the *point* of dedup).
+
+        We don't selectively commit non-duplicate events from the batch
+        because the FSM relies on "all events from one transition land
+        atomically." A batch is one transition; partial writes would
+        corrupt the audit chain.
+        """
         events = list(events)
         if not events:
             return []
@@ -82,8 +105,8 @@ class EventStore:
                         """
                         INSERT INTO event_store
                             (machine_id, event_type, correlation_id,
-                             occurred_at, payload_json)
-                        VALUES (%s, %s, %s, %s, %s)
+                             occurred_at, payload_json, dedup_key)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                         """,
                         (
                             ev.machine_id,
@@ -91,6 +114,7 @@ class EventStore:
                             ev.correlation_id,
                             ev.at,
                             _encode(ev),
+                            getattr(ev, "dedup_key", None),
                         ),
                     )
                     seq = cur.lastrowid
@@ -101,6 +125,18 @@ class EventStore:
                     seqs.append(seq)
             conn.commit()
             return seqs
+        except pymysql.err.IntegrityError as e:
+            conn.rollback()
+            # Error code 1062 = duplicate entry on a unique index.
+            # In this schema the only unique index that can collide is
+            # ux_dedup (event_type, dedup_key) — every other key is the
+            # auto-inc PK or a non-unique secondary. Translate into a
+            # domain-specific exception so the producer (typically
+            # MRPRecomputeScheduler) can swallow + log without grepping
+            # MySQL error codes.
+            if e.args and e.args[0] == 1062:
+                raise DuplicateEventError(str(e)) from e
+            raise
         except Exception:
             conn.rollback()
             raise
@@ -187,6 +223,26 @@ class EventStore:
             "locked_by = NULL, locked_at = NULL",
             params=(err[:500], event_seq),
         )
+
+    def attempts_for(self, event_seq: int) -> int:
+        """Return current attempts count for an outbox row.
+
+        Used by the relay's DLQ promotion check (after mark_failed
+        increments the counter, the relay asks "have we hit the cap?").
+        Kept here so the relay never speaks SQL — single-responsibility
+        for the persistence layer.
+        """
+        conn = self._conn_factory()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT attempts FROM event_outbox WHERE event_seq = %s",
+                    (event_seq,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+        finally:
+            conn.close()
 
     def move_to_dlq(self, event_seq: int, err: str) -> None:
         conn = self._conn_factory()

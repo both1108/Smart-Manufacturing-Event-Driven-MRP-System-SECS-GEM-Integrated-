@@ -39,7 +39,7 @@ from services.domain_events import (
 )
 from services.event_store import EventStore
 from services.ingest import RawEquipmentSignal
-from services.state_machine import StateMachine, UNKNOWN
+from services.state_machine import ALARM, StateMachine, UNKNOWN
 from utils.clock import utcnow
 
 log = logging.getLogger(__name__)
@@ -223,20 +223,39 @@ class MachineActor:
     # Core logic — pure DB/CPU work, safe in a thread
     # ------------------------------------------------------------------
     def _handle_sync(self, sig: RawEquipmentSignal) -> None:
-        # Operator override — while the tool is under manual control,
-        # sensor inference is advisory only. The UI still sees live
-        # telemetry (via heartbeats) so the chart keeps updating, but
-        # no FSM transitions fire until a releasing command lands.
+        # Always infer first (2026-05-04 safety fix).
         #
-        # Without this guard, a PAUSE on a healthy tool would flap:
-        # PAUSE drops IDLE → heartbeat samples still look normal →
-        # infer_state returns RUN → next tick advances IDLE → RUN,
-        # completely undoing the operator's intent.
-        if self._operator_hold is not None:
+        # Previous version short-circuited on `_operator_hold` BEFORE
+        # calling _infer, so a paused tool that physically faulted
+        # (coolant rupture → overheat) emitted only heartbeats —
+        # AlarmTriggered never fired, MRP impact was never recorded,
+        # operators saw a calm chart on a burning machine.
+        #
+        # SEMI E10 rule: operator state cannot mask a safety alarm.
+        # The hold legitimately suppresses normal IDLE/RUN flapping
+        # (a PAUSEd healthy tool would otherwise oscillate as sensors
+        # still report RUN-class metrics), but it must not suppress
+        # ALARM-class inference.
+        to_state, alid, reason = self._infer(sig.metrics)
+
+        if self._operator_hold is not None and to_state != ALARM:
+            # Held + non-alarm sample: behave as before (suppress the
+            # FSM transition, still emit a heartbeat for the live chart).
             self._maybe_emit_heartbeat(sig)
             return
 
-        to_state, alid, reason = self._infer(sig.metrics)
+        if self._operator_hold is not None and to_state == ALARM:
+            # Held + sensor says ALARM: the operator's intent ("paused")
+            # no longer describes reality. Clear the hold and let the
+            # transition through — downstream subscribers (CapacityTracker,
+            # MRPRecomputeScheduler, AlarmProjector) MUST see this.
+            log.warning(
+                "actor %s: alarm inferred under operator hold (%s); "
+                "releasing hold and firing AlarmTriggered (alid=%s reason=%s)",
+                self._cfg.machine_id, self._operator_hold, alid, reason,
+            )
+            self._operator_hold = None
+
         result = self._fsm.advance(
             machine_id=self._cfg.machine_id,
             from_state=self._state,

@@ -45,6 +45,7 @@ from db.mysql import get_mysql_conn
 from repositories.machine_capacity_repository import MachineCapacityRepository
 from repositories.mrp_input_repository import MRPInputRepository
 from services.domain_events import (
+    AlarmAcknowledged,
     AlarmReset,
     AlarmTriggered,
     DowntimeClosed,
@@ -68,6 +69,9 @@ from services.state_machine import StateMachine
 from services.subscribers import capacity_tracker, mrp_impact_handler
 from services.subscribers.alarm_projector import AlarmProjector
 from services.subscribers.mrp_recompute_scheduler import MRPRecomputeScheduler
+from services.subscribers.procurement_signal_projector import (
+    ProcurementSignalProjector,
+)
 from services.subscribers.read_model_projector import ReadModelProjector
 from services.subscribers.telemetry_projector import TelemetryProjector
 
@@ -162,6 +166,7 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
         HostCommandRequested,
         HostCommandDispatched,
         HostCommandRejected,
+        AlarmAcknowledged,
     ):
         register_event_type(cls)
 
@@ -228,6 +233,15 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
     alarm_projector = AlarmProjector(conn_factory=get_mysql_conn)
     alarm_projector.register(bus)
 
+    # Procurement signal projector (added 2026-05-04). Closes the
+    # equipment → business chain by turning every MRPPlanUpdated into
+    # a row in procurement_signals (keyed by correlation_id, so the
+    # full chain is one SQL JOIN back to the originating alarm).
+    procurement_projector = ProcurementSignalProjector(
+        conn_factory=get_mysql_conn,
+    )
+    procurement_projector.register(bus)
+
     # ---------- 4. Actor registry + rehydration ----------------------------
 
     registry = MachineActorRegistry(
@@ -277,6 +291,7 @@ async def bootstrap_event_pipeline() -> Dict[str, Any]:
         "projector": projector,
         "telemetry_projector": telemetry_projector,
         "alarm_projector": alarm_projector,
+        "procurement_projector": procurement_projector,
         **sources,   # "tailer" and/or "secs_host"
     }
     # Flip readiness only after every component is wired. If any step

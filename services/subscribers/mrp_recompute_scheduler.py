@@ -31,8 +31,17 @@ from services.domain_events import (
     MRPRecomputeRequested,
 )
 from services.event_bus import EventBus
-from services.event_store import EventStore
+from services.event_store import DuplicateEventError, EventStore
 from utils.clock import utcnow
+
+# Bucket size for the cross-process dedup key. The in-process
+# threading.Timer already collapses bursts inside ONE app instance;
+# this bucket protects across instances. 5 s matches the default
+# debounce_s — two app instances seeing the same alarm within the
+# same 5 s window will compute the same dedup_key and only one row
+# will land in event_store; the other gets DuplicateEventError and
+# is logged + skipped.
+_DEDUP_BUCKET_S = 5
 
 log = logging.getLogger(__name__)
 
@@ -135,18 +144,41 @@ class MRPRecomputeScheduler:
 
     # ------------------------------------------------------------------
     def _emit(self, part_no: str, payload: _Pending) -> None:
+        at = payload.at or utcnow()
+        # Time-bucketed key: floor(at, _DEDUP_BUCKET_S). Two scheduler
+        # instances racing on the same alarm burst will compute the
+        # same key inside the bucket and the DB rejects the second
+        # insert. We deliberately include `reason` so that a
+        # 'reconciled_loss' fired in the same bucket as a
+        # 'projected_loss' both get through — they carry distinct
+        # information and MRP wants to see both.
+        bucket = int(at.timestamp() // _DEDUP_BUCKET_S) * _DEDUP_BUCKET_S
+        dedup_key = f"mrp:{part_no}:{payload.reason}:{bucket}"
+
         ev = MRPRecomputeRequested(
             machine_id=payload.machine_id or "*",
-            at=payload.at or utcnow(),
+            at=at,
             correlation_id=payload.correlation_id,   # CHAIN BACK to trigger
+            dedup_key=dedup_key,
             part_no=part_no,
             reason=payload.reason,
             projected_loss_qty=payload.projected_loss_qty,
             triggered_by=payload.triggered_by,
         )
-        self._store.append_many([ev])
+        try:
+            self._store.append_many([ev])
+        except DuplicateEventError:
+            # Another instance already emitted this recompute for the
+            # same (part_no, reason, bucket). Expected behaviour under
+            # multi-instance deploy — log at info, not warn, because
+            # nothing is wrong.
+            log.info(
+                "MRPRecomputeRequested deduped part=%s reason=%s key=%s",
+                part_no, payload.reason, dedup_key,
+            )
+            return
         log.info(
-            "MRPRecomputeRequested part=%s reason=%s qty=%.2f corr=%s",
+            "MRPRecomputeRequested part=%s reason=%s qty=%.2f corr=%s key=%s",
             part_no, payload.reason, payload.projected_loss_qty,
-            payload.correlation_id,
+            payload.correlation_id, dedup_key,
         )

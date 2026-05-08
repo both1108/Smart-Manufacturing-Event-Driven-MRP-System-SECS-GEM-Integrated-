@@ -1,16 +1,18 @@
 """
-AlarmsQueryService — read + ack for the Alarms page.
+AlarmsQueryService — read-only surface for the Alarms page.
 
 Queries backed by alarm_view:
     list(status='active'|'cleared')  ordered newest triggered_at first
     summary()                         count by severity (active only)
-    acknowledge(machine_id, alid)     sets ack fields on the view row
+    fetch_one(machine_id, alid)       single alarm — used by the route to
+                                       echo state after an ack write.
 
-Ack is strictly a user action against the read model; it does NOT emit
-a domain event. That matches the rule "don't modify the write path" —
-ack is an HMI operation, not an equipment fact. If we later want ack
-to propagate (e.g. to ERP), turn it into an AlarmAcknowledged event and
-keep this service's update as the projection.
+Acknowledgment moved out of this service on 2026-05-04 — it now lives
+in services.application.alarm_command_service and emits an
+``AlarmAcknowledged`` domain event. The projector (AlarmProjector)
+applies the ack to alarm_view asynchronously via the outbox relay,
+which keeps the read model rebuildable from event_store and lets
+future subscribers react (Slack closer, MTTA rollup, ERP ticket).
 
 Severity taxonomy in the design system:
     CRITICAL / MAJOR / MINOR
@@ -21,7 +23,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from services.query.base import ReadQueryService
-from utils.clock import utcnow
 
 
 _ALLOWED_STATUS = ("active", "cleared", "all")
@@ -102,50 +103,13 @@ class AlarmsQueryService(ReadQueryService):
         }
 
     # ------------------------------------------------------------------
-    # POST /api/alarms/{alarm_id}/ack
+    # Read of a single alarm by composite key. The route uses this
+    # to echo the (eventually consistent) state after a write — the
+    # write itself moved to services.application.alarm_command_service
+    # on 2026-05-04 because acknowledgment is now an event, not a
+    # direct UPDATE on alarm_view.
     # ------------------------------------------------------------------
-    def acknowledge(
-        self,
-        machine_id: str,
-        alid: int,
-        user: str,
-    ) -> Optional[Dict]:
-        """Mark (machine_id, alid) acknowledged.
-
-        Idempotent: if already acknowledged, we don't overwrite the
-        existing ack (first-ack wins). Returns the updated row, or
-        None if the alarm doesn't exist.
-
-        This intentionally allows acknowledging an already-cleared
-        alarm — operators still want to record "I saw this" on alarms
-        that self-resolved before they could act.
-        """
-        now = utcnow()
-
-        # UPDATE before SELECT so a race between two operators only
-        # writes once. The guard `acknowledged_at IS NULL` makes the
-        # first ack win; subsequent acks become no-ops.
-        conn = self._conn_factory()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE alarm_view
-                    SET acknowledged_at = %s,
-                        acknowledged_by = %s
-                    WHERE machine_id = %s
-                      AND alid = %s
-                      AND acknowledged_at IS NULL
-                    """,
-                    (now, user, machine_id, alid),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
+    def fetch_one(self, machine_id: str, alid: int) -> Optional[Dict]:
         return self._fetch_one_alarm(machine_id, alid)
 
     # ------------------------------------------------------------------

@@ -43,7 +43,7 @@ History:
 import logging
 from typing import Callable
 
-from services.domain_events import AlarmReset, AlarmTriggered
+from services.domain_events import AlarmAcknowledged, AlarmReset, AlarmTriggered
 from services.event_bus import EventBus
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,10 @@ class AlarmProjector:
     def register(self, bus: EventBus) -> None:
         bus.subscribe(AlarmTriggered, self._on_alarm_triggered)
         bus.subscribe(AlarmReset, self._on_alarm_reset)
+        # Ack is now an event (2026-05-04) so the projection is
+        # rebuildable from event_store and downstream subscribers can
+        # learn that an ack happened.
+        bus.subscribe(AlarmAcknowledged, self._on_alarm_acknowledged)
 
     # ------------------------------------------------------------------
     # Triggered — insert-or-update. Three cases:
@@ -117,6 +121,25 @@ class AlarmProjector:
         """
         self._exec(sql, (
             ev.at, ev.at, ev.at, ev.machine_id, ev.alid,
+        ))
+
+    # ------------------------------------------------------------------
+    # Acknowledged — first-ack-wins. The guard `acknowledged_at IS NULL`
+    # makes replays / out-of-order events idempotent: a second ack for
+    # the same (machine, alid) is a no-op rather than overwriting the
+    # original ack metadata.
+    # ------------------------------------------------------------------
+    def _on_alarm_acknowledged(self, ev: AlarmAcknowledged) -> None:
+        sql = """
+        UPDATE alarm_view
+           SET acknowledged_at = %s,
+               acknowledged_by = %s
+         WHERE machine_id = %s
+           AND alid = %s
+           AND acknowledged_at IS NULL
+        """
+        self._exec(sql, (
+            ev.at, ev.acknowledged_by, ev.machine_id, ev.alid,
         ))
 
     # ------------------------------------------------------------------

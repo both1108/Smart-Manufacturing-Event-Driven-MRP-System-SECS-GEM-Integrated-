@@ -1,20 +1,10 @@
 # Smart Manufacturing Event-Driven MRP System
 
-> **SECS/GEM equipment events → production capacity → MRP → procurement decisions, in one auditable event pipeline.**
->
 > 從 SECS/GEM 設備事件 → 產線產能 → MRP → 採購決策，整合於同一條可追溯的事件流。
 
 ![Demo](demo.gif)
 
 ---
-
-## Project Overview
-
-This project is a Smart Manufacturing Event-Driven MRP system. It connects three layers that are usually owned by three different teams in a real factory — **equipment**, **production**, and **business** — into a single event-driven pipeline.
-
-A SECS/GEM alarm on a tool becomes, deterministically and auditably, a recomputed MRP plan and a purchase recommendation, with one `correlation_id` linking the entire chain.
-
-The architecture is event-store + transactional outbox + per-machine actor + finite state machine + CQRS read models, with a SECS/GEM HSMS host adapter speaking the actual fab-floor protocol.
 
 ### 中文 / Traditional Chinese
 
@@ -28,16 +18,6 @@ The architecture is event-store + transactional outbox + per-machine actor + fin
 
 ## What Problem This Solves
 
-In most factories, the equipment side, the production planning side, and the procurement side run on different systems with different data models. When a tool goes down, the planner finds out from a phone call, the buyer finds out from the planner, and by the time anyone reorders material, the line has already been starved.
-
-This project answers one question end-to-end:
-
-> **"When a tool alarms at 10:03, what should the buyer do, and why?"**
-
-The pipeline turns equipment events into business decisions without humans copy-pasting between systems, and leaves a query-able audit trail of every decision and its cause.
-
-### 中文
-
 在大部分的工廠裡，**設備端、生產規劃端、採購端**通常用三套不同的系統、三種不同的資料模型。當機台故障時，規劃人員是靠電話得知，採購人員是靠規劃人員得知 —— 等到真的下單補料時，產線早就已經缺料了。
 
 這個系統回答一個端到端的問題：
@@ -47,96 +27,6 @@ The pipeline turns equipment events into business decisions without humans copy-
 整條 pipeline 把**設備事件**自動轉換成**業務決策**，不需要人工跨系統複製貼上，每個決策的成因都會被記錄下來，事後可以用 SQL 查詢回溯。
 
 ---
-
-## Real-World Use Case / Practical Value
-
-This section is for readers who don't want to read code. It explains, in plain language, what this system actually does for the people who would use it.
-
-### Why SECS/GEM exists in real factories
-
-A modern semiconductor or electronics line has machines from many different vendors — Applied Materials, Lam, ASML, Tokyo Electron, and so on. Each tool measures temperature, vibration, throughput, and alarms in its own way. Without a common language, the factory's IT system would have to be re-coded for every new tool, and important signals would get lost in translation.
-
-**SECS/GEM is that common language.** It is a standard set of messages defined by SEMI (E4/E5/E30) that every fab-grade tool understands. Instead of writing custom integrations per vendor, the host system speaks SECS/GEM and any compliant tool plugs in. That is what `services/secs/host_adapter.py` does — it speaks the standard, so the rest of the system never has to know what brand the machine is.
-
-### What kind of data comes in from a machine
-
-Through the SECS/GEM channel (or, in the simpler IoT mode, through the database tailer), every tool continuously reports:
-
-- **Live sensor readings** — temperature, vibration, RPM, pressure
-- **State changes** — IDLE → RUN → ALARM → IDLE
-- **Alarm events** — alarm ID (ALID), alarm text (e.g. "Chamber overheat"), severity code (ALCD)
-- **Heartbeats** — periodic "I'm still alive" pings even when nothing has changed
-
-So the system always knows: which machine, in what state, with what sensor values, at what time.
-
-### A concrete example, end to end
-
-Imagine a real morning on the line:
-
-1. **08:14** — Machine M-02 (a coating tool that produces wafers used in PART-A) is running normally. Temperature 68°C, vibration steady.
-2. **08:31** — Vibration begins climbing. The chamber is heating up beyond spec.
-3. **08:33** — M-02 crosses the temperature threshold and triggers ALID 1001 ("Chamber overheat"). The tool sends an S6F11 alarm message to the host over SECS/GEM.
-4. **08:33** — The system records `AlarmTriggered{machine_id=M-02, alid=1001, ...}`. State changes from RUN to ALARM. A downtime row opens.
-5. **08:38** — Five seconds after the alarm settles, the system writes `MRPRecomputeRequested` for PART-A with a projected loss based on typical recovery time.
-6. **08:38** — `MRPRunner` simulates the next 30 days of inventory for PART-A, subtracting that capacity loss from incoming supply. It finds that on Wednesday next week, PART-A will be **~800 units short**.
-7. **08:38** — `MRPPlanUpdated` is emitted: `suggested_po_qty = 800, suggested_order_date = tomorrow` (lead time is 2 days).
-8. **08:38** — The dashboard now shows an alarm card on M-02, a red "shortage" indicator on PART-A, and a "Recommended PO: 800 units by tomorrow" callout.
-9. **09:20** — Maintenance fixes the overheat issue. M-02 transitions back to RUN. The downtime row closes with the actual lost time (47 minutes).
-10. **09:25** — A second MRP recompute runs with the **real** loss. Turns out the actual shortfall is 620, not 800. The dashboard updates the recommendation.
-11. **The buyer** sees one clear, traceable recommendation — not a flood of alarms. They place a 620-unit PO. The line never runs short.
-
-Without this system, that 47-minute outage would only be noticed by the person standing next to M-02 — and the procurement team would discover the resulting shortage the following week, after the line had already gone down for material.
-
-### Cause and effect, in one picture
-
-```
-machine overheats
-        │
-        ▼
-alarm fires (SECS/GEM S6F11)
-        │
-        ▼
-machine stops producing
-        │
-        ▼
-production capacity for PART-A drops today
-        │
-        ▼
-MRP recalculates → predicts shortage next Wednesday
-        │
-        ▼
-system suggests: order 620 units of PART-A by tomorrow
-        │
-        ▼
-buyer places PO with full traceability back to the alarm
-```
-
-### What outputs / predictions the system produces
-
-- **Live machine state** for every tool.
-- **Active alarms** with ALID, text, machine, and start time.
-- **Capacity loss per part per day** — how much output was actually lost.
-- **Future material shortage forecast** — when each part will run out.
-- **Purchase recommendations** — for each at-risk part: how much to order and by when.
-- **Audit trail** — every alarm, decision, and recommendation linked by a single ID, so any past decision can be explained later.
-
-### What decisions a user can make from this
-
-- **Operators** see "M-02 has been in alarm for 5 minutes, root cause is chamber overheat" and dispatch maintenance immediately, instead of walking the floor to check.
-- **Maintenance engineers** prioritize repairs by **business impact** — fix the tool that causes the biggest downstream shortage first.
-- **Production planners** see executable output (capacity-adjusted) versus market demand and can adjust customer commitments proactively, not after the fact.
-- **Buyers** receive a clear PO recommendation with quantity, date, and the alarm that caused it — not a gut feeling or a phone call from the planner.
-- **Plant managers** see fleet-wide health, recurring alarm patterns, and whether shortages keep coming back to the same part or the same tool.
-
-### Why each role wins
-
-| Role | What they get |
-|---|---|
-| Operator | Fast, accurate alerts; one-click START / STOP from the dashboard with full audit. |
-| Maintenance engineer | A repair queue ordered by business impact, not just by alarm time. |
-| Production planner | A realistic plan that already accounts for today's downtime. |
-| Buyer | Concrete PO suggestions, with the cause and timestamp behind each one. |
-| Plant manager | A trustworthy fleet view; full root-cause traceability for any past decision. |
 
 ### 中文 / 真實工廠的實際用途
 
@@ -228,17 +118,6 @@ MRP 重算 → 預測下週三缺料
 
 ## System Benefits
 
-| Benefit | What it means in practice |
-|---|---|
-| **Equipment-to-business traceability** | Every purchase recommendation can be JOIN-ed back to the original alarm via `correlation_id`. |
-| **Capacity-aware planning** | MRP is run against forecast *minus actual capacity loss*, not against forecast alone. |
-| **Demand vs. executable output separated** | The dashboard shows market demand and capacity-adjusted producible output as two distinct curves. |
-| **Auditable by design** | The event store is append-only; replaying any decision is a SQL query against historical events. |
-| **Transport-agnostic equipment edge** | The same downstream pipeline accepts signals from the SECS/GEM HSMS adapter or the legacy IoT simulator behind a single feature flag. |
-| **Multi-instance safe write path** | The outbox uses `FOR UPDATE SKIP LOCKED`, so multiple app replicas can drain events in parallel without duplication. |
-
-### 中文
-
 | 系統效益 | 實際意義 |
 |---|---|
 | **設備到業務的追溯性** | 任何一筆採購建議都能用 `correlation_id` 反查到原始的設備警報。 |
@@ -251,19 +130,6 @@ MRP 重算 → 預測下週三缺料
 ---
 
 ## Core Features
-
-- **SECS/GEM HSMS host** with one session per machine (`services/secs/`), decoding S6F11 events into typed domain events.
-- **Per-machine actor model** (`services/machine_actor.py`) — every machine has one mailbox, one consumer, no cross-machine races.
-- **Per-machine FSM** over `{IDLE, RUN, ALARM, UNKNOWN}` (`services/state_machine.py`).
-- **Event store + transactional outbox** in MySQL (`services/event_store.py`).
-- **Single-publisher outbox relay** with DLQ and retry (`services/outbox_relay.py`).
-- **Debounced two-phase MRP recomputation** — projected loss on alarm, reconciled loss on recovery (`services/subscribers/mrp_recompute_scheduler.py`).
-- **Capacity-adjusted MRP** consuming `capacity_loss_daily` from real downtime (`services/mrp_service.py`, `services/subscribers/capacity_tracker.py`).
-- **CQRS read models** (`machine_status_view`, `mrp_plan_view`) projected by subscribers (`services/subscribers/read_model_projector.py`).
-- **JSON API + React dashboard** reading exclusively from read models (`routes/`, `services/query/`, `Frontend/`).
-- **Operator command override** — manual state changes flow through the same actor mailbox as telemetry, so START/STOP clicks can never race against stale samples (`services/domain_events.py` host-command events, `services/machine_actor.py` `ControlAction`).
-
-### 中文
 
 - **SECS/GEM HSMS host**（`services/secs/`）：每台機台一條 session，把 S6F11 解碼成型別化的 domain event。
 - **Per-machine actor**（`services/machine_actor.py`）：每台機台一個信箱、一個消費者，跨機台不會 race。
@@ -525,20 +391,6 @@ The principle is simple: **the dashboard tells the user what to do, and links ea
 
 ---
 
-## Known Limitations
-
-This is a working demo / portfolio system, not a production deployment. Issues identified in `docs/2026-04-27_project_evolution_and_technical_achievements.md`:
-
-- **MRP recomputation still runs on the relay path.** `MRPRunner._on_recompute` is a synchronous subscriber called from inside `OutboxRelay._drain_once`. A slow simulation blocks dispatch for every other machine. The next upgrade (see Roadmap) is to move it to a persisted command queue + independent worker.
-- **`EventBus` swallows subscriber exceptions, but the outbox marks the event dispatched anyway.** `event_bus.py` catches and logs handler errors; the relay sees a clean return and acks. A failing `CapacityTracker` write can leave the audit log looking perfect while the downstream MRP impact is missing. Needs per-subscriber acknowledgment.
-- **`MachineHeartbeat` is stored in `event_store`.** At fleet scale this dominates the audit table with mostly-identical metric snapshots. Heartbeats should land in a separate telemetry table or time-series store.
-- **Debounce state is in-memory.** `MRPRecomputeScheduler` keeps `_pending` and `_timers` per process, so two app replicas would emit two `MRPRecomputeRequested` events with different `correlation_id`s. Needs persistence in MySQL.
-- **Postgres procurement projector is not wired yet.** The dual-DB split (MySQL ERP + Postgres business) exists in `requirements.txt` and `docker-compose.yml`, but no subscriber currently writes `MRPPlanUpdated` into a Postgres business-side table. The "equipment → business" bridge is half-built.
-- **Single-process Flask + asyncio.** `app.py` runs the event pipeline on a daemon thread; this works for one replica but does not safely scale behind `gunicorn --workers N`. HTTP and pipeline should be split into separate entrypoints before scale-out.
-- **No metrics / observability layer yet.** No Prometheus counters for `events_published_total`, `outbox_lag_seconds`, `dlq_depth`, `mrp_recompute_duration_seconds`. You can run this; you cannot yet operate it under SLOs.
-- **No event schema versioning.** `_decode` does `cls(**raw)` blind; adding a field to an existing event will break replay of old events.
-- **Demo-scale fixtures.** Three machines, one BOM, single-shift capacity. Realistic SECS/GEM scenarios (lot start/end, recipe drift, planned maintenance) are not modeled.
-
 ### 中文 / 已知限制
 
 這是一個能跑、能 demo、能放履歷的系統，但**不是 production 部署**。`docs/2026-04-27_project_evolution_and_technical_achievements.md` 已記錄以下問題：
@@ -555,20 +407,7 @@ This is a working demo / portfolio system, not a production deployment. Issues i
 
 ---
 
-## Future Improvements / Roadmap
-
-Listed in priority order. The first three are the core of the next architectural milestone.
-
-1. **Persisted `mrp_command_queue` table.** Replace the inline `MRPRunner` subscription with a durable queue row. Schema mirrors the outbox: `(id, part_no, reason, triggered_by, correlation_id, source_event_seq, enqueued_at, picked_at, picked_by, finished_at, attempts, last_error)`.
-2. **Independent `MRPWorker`.** Drains `mrp_command_queue` with the same `FOR UPDATE SKIP LOCKED` pattern, runs `simulate_inventory_and_mrp`, writes `MRPPlanUpdated` to `event_store`. The relay remains the single publisher.
-3. **Better subscriber failure handling.** Either re-raise from `EventBus.publish` (let the relay's existing retry/DLQ cover it), or add an `event_subscriber_offsets` table for per-subscriber ack.
-4. **Telemetry table or time-series store.** Route `MachineHeartbeat` to `machine_telemetry` (or InfluxDB / TimescaleDB on the Postgres side) instead of `event_store`.
-5. **Postgres procurement projector.** New `services/subscribers/procurement_projector.py` listens on `MRPPlanUpdated` and writes to a Postgres `purchase_recommendations(part_no, suggested_qty, suggested_date, correlation_id, source_alarm_correlation)` table — closing the equipment-to-business loop.
-6. **Metrics / observability.** Prometheus exporter for relay lag, DLQ depth, MRP latency, ingest queue depth. Grafana dashboards. Alert on `dlq_depth > 0`.
-7. **Production-grade deployment split.** Separate `worker.py` entrypoint from `app.py` so the HTTP side can scale with `gunicorn --workers N` while the pipeline runs as its own deployment.
-8. **More realistic SECS/GEM simulator scenarios.** Lot start/complete (S6F11 with `lot_id`), recipe drift, planned-maintenance windows, alarm severities tied to ALCD, multi-tool dependencies.
-9. **Event schema versioning.** Add `payload_version` per event; reject or migrate on mismatch in `_decode`.
-10. **OEE rollup as a read model.** `OEEDaily(machine_id, date, availability, performance, quality)` projected from `StateChanged`, `LotCompleted`, `AlarmTriggered`.
+ as a read model.** `OEEDaily(machine_id, date, availability, performance, quality)` projected from `StateChanged`, `LotCompleted`, `AlarmTriggered`.
 
 ### 中文 / 後續發展路線
 
@@ -622,26 +461,6 @@ Set `SIGNAL_SOURCE` in `.env`:
 
 When `SIGNAL_SOURCE=secsgem`, also set `SIMULATOR_ENTRYPOINT=-m simulators.secs_equipment.main` so the simulator container speaks SECS instead of writing to `machine_data`.
 
-### Example `.env`
-
-```env
-# MySQL (ERP + manufacturing event pipeline)
-MYSQL_HOST=mysql
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=root
-MYSQL_DB=erp
-
-# PostgreSQL (orders + business side)
-PG_HOST=postgres
-PG_PORT=5432
-PG_USER=user
-PG_PASSWORD=password
-PG_DB=transactions
-
-# Equipment transport
-SIGNAL_SOURCE=tailer
-# SIMULATOR_ENTRYPOINT=iot_simulator.py
 ```
 
 ### 中文 / 如何啟動
@@ -668,21 +487,6 @@ React 儀表板在 `Frontend/`，開發時建議獨立 origin（例如 `python -
 ---
 
 ## API / Dashboard Overview
-
-All endpoints live under `/api/*` and read from CQRS read models. The React dashboard is the primary consumer.
-
-| Endpoint | Source / read model | What it returns |
-|---|---|---|
-| `GET /api/dashboard` | `services/query/dashboard_query.py` | Aggregated dashboard payload (summary cards, charts). |
-| `GET /api/machines` | `machine_status_view` via `services/query/machines_query.py` | Current state of every tool, last update time. |
-| `GET /api/events` | `event_store` (recent slice) via `services/query/events_query.py` | Recent equipment / business events for the timeline view. |
-| `GET /api/alarms` | alarm read model via `services/query/alarms_query.py` | Active and recent alarms with ALID / ALCD / ALARM_TEXT. |
-| `GET /api/mrp` | `mrp_plan_view` via `routes/mrp_routes.py` | Latest plan summary per part: shortage qty, suggested PO qty, suggested order date. |
-| `POST /api/mrp/recompute` | injects `MRPRecomputeRequested(reason="manual")` | Manual recompute trigger. |
-| `POST /api/equipment/.../command` | `services/query/command_service.py` → actor mailbox | Operator command (START/STOP) — produces auditable host-command events. |
-| `GET /healthz` / `GET /readyz` | `app.py` | Operator-facing process and pipeline-readiness probes. |
-
-### 中文
 
 所有端點都在 `/api/*` 之下，全部從 CQRS 讀模型讀資料。React 儀表板是主要消費者。
 
@@ -771,27 +575,9 @@ All endpoints live under `/api/*` and read from CQRS read models. The React dash
 
 ---
 
-## Why This Project Matters
-
-This is **not a generic ERP/MRP demo**. The interesting claim it makes — and substantiates in code — is:
-
-> **Equipment-level events can drive procurement decisions, deterministically and auditably, in one event-driven pipeline.**
-
-A SECS/GEM alarm at 10:03 on M-02 produces `AlarmTriggered` → `DowntimeClosed` → `MRPRecomputeRequested` → `MRPPlanUpdated` → a row in the dashboard, all sharing one `correlation_id`. Every step is durable in the event store, every step is replayable, every step is JOIN-able by SQL. That is the entire equipment → production → business chain that real factories struggle to keep coherent across three teams.
-
-The project also demonstrates senior-level architectural decisions worth defending in a system-design interview:
-- Why an **event store + outbox** is mandatory (not optional) for a system where "alarm in DB but not delivered to MRP" is a correctness bug, not a degraded state.
-- Why **one actor per machine** is the right concurrency model for equipment, not threads or shared state.
-- Why **CQRS read models** matter the moment a dashboard exists — you cannot serve a fleet view from an audit log.
-- Why **`FOR UPDATE SKIP LOCKED`** is the multi-instance safety net that lets the system grow past one replica.
-- Why **debounced two-phase MRP** is the right trade-off between alarm-time prediction and recovery-time correction.
-- Why **in-process pub/sub** is the correct choice *today* (single team, one line) and Redis/Kafka would be premature — and what specifically would justify the migration later.
-
-The documents under `docs/` and `SECSGEM/` (architecture reviews, code review, achievements summary) record both what was built and what remains intentionally unfinished, so the system can be read and extended honestly.
-
 ### 中文 / 為什麼這個專案重要
 
-這**不是又一個 ERP/MRP demo**。它真正主張、而且用程式碼證明的是：
+這不是又一個 ERP/MRP demo。它真正主張、而且用程式碼證明的是：
 
 > **設備層級的事件可以確定性地、且可稽核地驅動採購決策，全部在同一條事件驅動 pipeline 裡。**
 
