@@ -43,7 +43,7 @@
 
 下游所有子系統都在反應同一條事件流。沒有跨團隊 API 呼叫、沒有夜間批次、也沒有「我們之後再 sync」這件事。
 
-📊 完整流程圖：[`system_flow_zh.png`](system_flow.png)
+📊 完整流程圖：[`system_flow_zh.png`](system_flow_zh.png)
 
 ---
 
